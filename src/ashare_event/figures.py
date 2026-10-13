@@ -130,7 +130,6 @@ def save_car_path(
     ax.fill_between(x[ok], (mean - band)[ok], (mean + band)[ok], color=BAND, alpha=0.18, linewidth=0)
     ax.set_xlabel(text(language, "rel_day"))
     ax.set_ylabel(text(language, "mean_car"))
-    fig.tight_layout()
     _save(fig, destination)
     if language == "zh":
         band_note = "阴影是按平均残差相关加宽后的 95% 区间。" if widened else "阴影是横截面 95% 区间。"
@@ -162,7 +161,6 @@ def save_placebo(
         ax.axvline(actual, color=VERMILLION, linewidth=1.4)
     ax.set_xlabel(text(language, "placebo_x"))
     ax.set_ylabel(text(language, "placebo_y"))
-    fig.tight_layout()
     _save(fig, destination)
     name = text(language, result["mode"])
     if language == "zh":
@@ -174,10 +172,9 @@ def save_group_bars(
     frame: pd.DataFrame,
     destination: Path,
     *,
-    title: str,
     size: tuple[float, float],
 ) -> None:
-    """Horizontal mean-CAR bars. Sign uses navy and brown, not red and green."""
+    """Horizontal mean-CAR bars. The caption lives outside the figure."""
     _theme()
     fig, ax = plt.subplots(figsize=size)
     if frame.empty:
@@ -191,8 +188,6 @@ def save_group_bars(
     labels = [f"{name}{stars}" for name, stars in zip(ordered["label"], ordered["stars"], strict=True)]
     ax.set_yticks(y, labels)
     ax.set_xlabel("平均 CAR")
-    ax.set_title(title, loc="left", color="#1f4e79", fontsize=11)
-    fig.tight_layout()
     _save(fig, destination)
 
 
@@ -214,13 +209,13 @@ def save_grouped_paths(frame: pd.DataFrame, destination: Path, *, size: tuple[fl
         x_values = order["rel_day"].to_numpy()
         mean = order["mean"].to_numpy(dtype=float)
         band = 1.96 * order["se"].to_numpy(dtype=float)
-        ax.plot(x_values, mean, color=color, linewidth=1.5, label=str(name))
-        ok = np.isfinite(band)
+        ok = np.isfinite(mean) & np.isfinite(band)
+        ax.plot(x_values[np.isfinite(mean)], mean[np.isfinite(mean)], color=color, linewidth=1.5, label=str(name))
         ax.fill_between(x_values[ok], (mean - band)[ok], (mean + band)[ok], color=color, alpha=0.12, linewidth=0)
     ax.set_xlabel("相对事件日的交易日")
     ax.set_ylabel("平均 CAR")
-    ax.legend(frameon=False, fontsize=8)
-    fig.tight_layout()
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(frameon=False, fontsize=8, loc="best")
     _save(fig, destination)
 
 

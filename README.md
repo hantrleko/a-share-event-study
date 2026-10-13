@@ -6,7 +6,7 @@
 
 ## 在线使用
 
-打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。当前版本 V0.3。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。
+打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。当前版本 V0.4。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。
 
 ## 先跑演示
 

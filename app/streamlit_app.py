@@ -6,8 +6,11 @@ and become columns in the same table.
 
 from __future__ import annotations
 
+import inspect
+import io
 import re
 import sys
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -217,7 +220,7 @@ def _demo_events(config_path: str) -> pd.DataFrame:
 def _blank_grid(variables: list[dict], rows: int = 6) -> pd.DataFrame:
     data: dict[str, list] = {
         "code": [""] * rows,
-        "event_date": [pd.NaT] * rows,
+        "event_date": [None] * rows,
         "event_type": [""] * rows,
         "industry": [""] * rows,
         "firm_name": [""] * rows,
@@ -231,7 +234,7 @@ def _align_grid(frame: pd.DataFrame, variables: list[dict]) -> pd.DataFrame:
     aligned = frame.copy()
     for field, default in (
         ("code", ""),
-        ("event_date", pd.NaT),
+        ("event_date", None),
         ("event_type", ""),
         ("industry", ""),
         ("firm_name", ""),
@@ -241,6 +244,9 @@ def _align_grid(frame: pd.DataFrame, variables: list[dict]) -> pd.DataFrame:
     for variable in variables:
         if variable["name"] not in aligned.columns:
             aligned[variable["name"]] = np.nan if variable["kind"] == "number" else ""
+    if "event_date" in aligned.columns:
+        parsed = pd.to_datetime(aligned["event_date"], errors="coerce")
+        aligned["event_date"] = [None if pd.isna(value) else pd.Timestamp(value).date() for value in parsed]
     order = [*STANDARD_FIELDS, *[variable["name"] for variable in variables]]
     return aligned.loc[:, order]
 
@@ -278,6 +284,76 @@ def _drop_close_events(frame: pd.DataFrame, window: tuple[int, int]) -> pd.DataF
                 keep.append(idx)
                 last = row["_when"]
     return work.loc[keep].drop(columns="_when")
+
+
+def _stretch(widget) -> dict:
+    """Width argument the installed Streamlit actually accepts.
+
+    Newer releases take ``width='stretch'``. Older ones only accept an integer
+    width, and still understand ``use_container_width``.
+    """
+    params = inspect.signature(widget).parameters
+    width = params.get("width")
+    if width is not None and "stretch" in str(getattr(width, "annotation", "")):
+        return {"width": "stretch"}
+    if "use_container_width" in params:
+        return {"use_container_width": True}
+    return {}
+
+
+def _show_png(path: Path, caption: str) -> None:
+    if not path.exists() or path.stat().st_size < 800:
+        st.info("这张图还在写入。再切换一次即可。")
+        return
+    st.image(path.read_bytes(), caption=caption, **_stretch(st.image))
+
+
+def _result_zip(result, cfg, figure_dir: Path, table_dir: Path) -> bytes:
+    windows = ", ".join(f"[{int(row.t1)}, {int(row.t2)}]" for row in result.tests.itertuples(index=False))
+    firms = int(result.events["firm_id"].nunique()) if len(result.events) and "firm_id" in result.events.columns else 0
+    lines = [
+        "A股事件研究 · 本次运行说明",
+        "",
+        f"模式：{cfg.mode}",
+        f"收益模型：{cfg.model}",
+        f"基准：{cfg.benchmark}",
+        f"复权：{cfg.adjust or '不复权'}",
+        f"估计窗：[{cfg.estimation_window[0]}, {cfg.estimation_window[1]}]",
+        f"路径窗：[{cfg.path_window[0]}, {cfg.path_window[1]}]",
+        f"回归窗：[{cfg.regression_window[0]}, {cfg.regression_window[1]}]",
+        f"CAR 窗：{windows}",
+        f"随机种子：{cfg.seed}",
+        f"进入估计的事件数：{len(result.events)}",
+        f"公司数：{firms}",
+        "",
+        "市场模型异常收益是相对基准的统计偏离，不是平均处理效应。",
+        "平均 CAR 对每条公司-事件等权。同一公司同一天不能重复。",
+        "星号来自首选检验，没有做多重检验校正。",
+        "图内不写标题，说明在文件名和这张说明里。",
+    ]
+    if result.simulated:
+        lines.append("本次数值来自模拟样本，不能写入论文。")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("methods_note.txt", ("\n".join(lines) + "\n").encode("utf-8"))
+        archive.writestr("csv/car_windows.csv", result.tests.to_csv(index=False).encode("utf-8-sig"))
+        archive.writestr("csv/event_car.csv", result.events.to_csv(index=False).encode("utf-8-sig"))
+        if table_dir.exists():
+            for path in sorted(table_dir.glob("*.tex")):
+                text = path.read_text(encoding="utf-8").strip()
+                if text:
+                    archive.writestr(f"tex/{path.name}", text.encode("utf-8"))
+        if figure_dir.exists():
+            for path in sorted(figure_dir.glob("*.png")):
+                if path.stat().st_size >= 800:
+                    archive.writestr(f"png/{path.name}", path.read_bytes())
+    return buf.getvalue()
+
+
+def _group_label(column: str, name) -> str:
+    if column == "event_type":
+        return event_type_label("zh", str(name))
+    return str(name)
 
 
 def _has_example_name(frame: pd.DataFrame | None) -> bool:
@@ -432,11 +508,11 @@ def _levels(frame: pd.DataFrame, column: str) -> list[str]:
 
 def _column_config(variables: list[dict]) -> dict:
     config = {
-        "code": st.column_config.TextColumn(FIELD_LABELS["code"], help=FIELD_HELP["code"], required=True),
-        "event_date": st.column_config.DateColumn(FIELD_LABELS["event_date"], help=FIELD_HELP["event_date"], format="YYYY-MM-DD"),
-        "event_type": st.column_config.TextColumn(FIELD_LABELS["event_type"], help=FIELD_HELP["event_type"]),
-        "industry": st.column_config.TextColumn(FIELD_LABELS["industry"], help=FIELD_HELP["industry"]),
-        "firm_name": st.column_config.TextColumn(FIELD_LABELS["firm_name"], help=FIELD_HELP["firm_name"]),
+        "code": st.column_config.TextColumn(FIELD_LABELS["code"], help=FIELD_HELP["code"], required=True, width="medium"),
+        "event_date": st.column_config.DateColumn(FIELD_LABELS["event_date"], help=FIELD_HELP["event_date"], format="YYYY-MM-DD", width="medium"),
+        "event_type": st.column_config.TextColumn(FIELD_LABELS["event_type"], help=FIELD_HELP["event_type"], width="medium"),
+        "industry": st.column_config.TextColumn(FIELD_LABELS["industry"], help=FIELD_HELP["industry"], width="medium"),
+        "firm_name": st.column_config.TextColumn(FIELD_LABELS["firm_name"], help=FIELD_HELP["firm_name"], width="large"),
     }
     for variable in variables:
         help_text = VARIABLE_HELP.get(
@@ -444,9 +520,9 @@ def _column_config(variables: list[dict]) -> dict:
             "你添加的变量。数值列会进入回归；文本列只用于辨认或筛选。",
         )
         if variable["kind"] == "number":
-            config[variable["name"]] = st.column_config.NumberColumn(variable["name"], help=help_text)
+            config[variable["name"]] = st.column_config.NumberColumn(variable["name"], help=help_text, width="small")
         else:
-            config[variable["name"]] = st.column_config.TextColumn(variable["name"], help=help_text)
+            config[variable["name"]] = st.column_config.TextColumn(variable["name"], help=help_text, width="medium")
     return config
 
 
@@ -745,11 +821,23 @@ with st.sidebar:
         missing.append("本地行情")
     if window_error or import_error:
         missing.append("窗口或事件表")
-    run = st.button("运行并导出", type="primary", disabled=bool(missing))
+    block_reason = ""
     if source == "我的事件表" and event_ready is None:
-        st.caption("还差：至少一行证券代码和事件日期。")
-    if example_blocked:
-        st.caption("公司名里还有「示例」，运行已停用。这是政策日示例，不是公司公告。核对后删掉「示例」再运行。")
+        block_reason = "还不能运行：至少填一行证券代码和事件日期。"
+    elif example_blocked:
+        block_reason = "还不能运行：公司名里还有「示例」。这是政策日示例，不是公司公告。核对后删掉这两个字。"
+    elif price_mode == "local" and (prices_frame is None or market_frame is None):
+        block_reason = "还不能运行：本地行情要同时上传个股和指数文件。"
+    elif window_error or import_error:
+        block_reason = window_error or import_error or "窗口或事件表还有问题。"
+    run = st.button(
+        "运行并导出",
+        type="primary",
+        disabled=bool(missing),
+        help=block_reason or "按左侧设定计算累计异常收益、路径和回归。",
+    )
+    if block_reason:
+        st.caption(block_reason)
     if source == "我的事件表" and st.button("清空事件表", key="clear_grid"):
         st.session_state.custom_vars = []
         st.session_state.event_grid = _blank_grid([])
@@ -765,7 +853,7 @@ with title_col:
     st.markdown(
         """
 <div class="brand">
-  <p class="kicker">V0.3 · EUGENE FINANCE</p>
+  <p class="kicker">V0.4 · EUGENE FINANCE</p>
   <h1>EF Lab · A 股事件研究流水线</h1>
   <p class="subtitle">Interactive Event Study Pipeline for A-Shares · 仅供学习与研究，不构成投资建议</p>
 </div>
@@ -808,7 +896,9 @@ if source != "演示样本":
         num_rows="dynamic",
         column_config=_column_config(st.session_state.custom_vars),
         hide_index=True,
+        height=360,
         key="event_editor",
+        **_stretch(st.data_editor),
     )
     st.session_state.event_grid = edited
 
@@ -927,15 +1017,15 @@ if run or st.session_state.get("study_result") is not None:
               continue
           mean, _t, p_value = mean_t(values)
           se = float(values.std(ddof=1) / np.sqrt(values.size))
-          rows.append({"label": str(name), "mean": mean * cfg.return_scale, "se": se * cfg.return_scale, "stars": star_mark(p_value), "n": int(values.size)})
+          rows.append({"label": _group_label(column, name), "mean": mean * cfg.return_scale, "se": se * cfg.return_scale, "stars": star_mark(p_value), "n": int(values.size)})
       return pd.DataFrame(rows)
 
   industry_groups = _grouped("industry")
   type_groups = _grouped("event_type")
   if not industry_groups.empty:
-      save_group_bars(industry_groups, figure_dir / "fig_car_by_industry.png", title="按行业的平均 CAR", size=tuple(cfg.figure_size))
+      save_group_bars(industry_groups, figure_dir / "fig_car_by_industry.png", size=tuple(cfg.figure_size))
   if not type_groups.empty:
-      save_group_bars(type_groups, figure_dir / "fig_car_by_type.png", title="按事件类型的平均 CAR", size=tuple(cfg.figure_size))
+      save_group_bars(type_groups, figure_dir / "fig_car_by_type.png", size=tuple(cfg.figure_size))
 
   def _paths_for(column: str) -> pd.DataFrame:
       if result.panel.empty or "car_path" not in result.panel.columns or column not in result.events.columns:
@@ -951,7 +1041,7 @@ if run or st.session_state.get("study_result") is not None:
               continue
           rows.append(
               {
-                  "group": str(group),
+                    "group": _group_label(column, group),
                   "rel_day": int(day),
                   "mean": float(values.mean()) * cfg.return_scale,
                   "se": float(values.std(ddof=1) / np.sqrt(values.size)) * cfg.return_scale,
@@ -983,32 +1073,35 @@ if run or st.session_state.get("study_result") is not None:
           help="路径按交易日累加。分组柱用的是侧栏里当前选中的 CAR 窗。",
       )
       path_fig = figure_dir / "fig_car_path.png"
-      if view == "整体路径" and path_fig.exists():
-          st.image(str(path_fig), caption="整体平均 CAR 路径。阴影是 95% 区间，竖线是事件日。")
+      if view == "整体路径":
+          _show_png(path_fig, "整体平均 CAR 路径。阴影是 95% 区间，竖线是事件日。图内不写标题，说明在这行。")
       elif view == "分组路径":
           group_choice = st.radio("分组", ["行业", "事件类型"], horizontal=True, key="path_group")
           group_path = figure_dir / ("fig_car_path_by_industry.png" if group_choice == "行业" else "fig_car_path_by_type.png")
-          if group_path.exists():
-              st.image(str(group_path), caption="每条线是一组的平均 CAR 路径，阴影是该组的 1.96 倍标准误。组内不足 2 家的不画。最多 6 组。")
-          else:
-              st.caption("这一组没有足够的公司可以画多条路径。")
+          _show_png(group_path, "每条线是一组的平均 CAR 路径，阴影是该组的 1.96 倍标准误。组内不足 2 家的不画。最多 6 组。事件类型用中文名。")
       elif view == "分组柱":
           industry_fig = figure_dir / "fig_car_by_industry.png"
           type_fig = figure_dir / "fig_car_by_type.png"
           bar_left, bar_right = st.columns(2)
-          if industry_fig.exists():
-              bar_left.image(str(industry_fig), caption="按行业。误差线是 95% 区间，星号来自该组的横截面 t。")
-          if type_fig.exists():
-              bar_right.image(str(type_fig), caption="按事件类型。星号：* 10%，** 5%，*** 1%。")
-          if not industry_fig.exists() and not type_fig.exists():
-              st.caption("分组里至少要有 2 家公司，才会画出柱图。")
+          left_bytes = industry_fig.read_bytes() if industry_fig.exists() and industry_fig.stat().st_size >= 800 else None
+          right_bytes = type_fig.read_bytes() if type_fig.exists() and type_fig.stat().st_size >= 800 else None
+          if left_bytes:
+              bar_left.image(left_bytes, caption="按行业。误差线是 95% 区间，星号来自该组的横截面 t。", **_stretch(st.image))
+          if right_bytes:
+              bar_right.image(right_bytes, caption="按事件类型。星号：* 10%，** 5%，*** 1%。", **_stretch(st.image))
+          if left_bytes is None and right_bytes is None:
+              st.info("分组柱还在写入，或这一组不足 2 家公司。再切换一次即可。")
       else:
           if not result.placebos:
               st.caption("左侧勾选「做安慰剂」后，这里出现安慰剂分布。")
+          shown = False
           for mode_name in result.placebos:
               picture = figure_dir / f"fig_placebo_{mode_name}.png"
-              if picture.exists():
-                  st.image(str(picture), caption="安慰剂直方图。柱是挪走事件日后的平均 CAR，竖线是真实日期。")
+              if picture.exists() and picture.stat().st_size >= 800:
+                  _show_png(picture, "安慰剂直方图。柱是挪走事件日后的平均 CAR，竖线是真实日期。")
+                  shown = True
+          if result.placebos and not shown:
+              st.info("安慰剂图还在写入。再切换一次即可。")
   with tab_table:
       st.caption("每一行是一个累加窗口。平均 CAR 已换成百分点。显著性按首选检验标注。")
       show = result.tests.copy()
@@ -1021,7 +1114,7 @@ if run or st.session_state.get("study_result") is not None:
       st.dataframe(
           show[["窗口", "n", "平均 CAR", "显著性", "横截面 t", "BMP t", "KP t", "组合 t", "首选"]].rename(columns={"n": "N"}),
           hide_index=True,
-          use_container_width=True,
+          **_stretch(st.dataframe),
       )
   with tab_reg:
       st.caption("系数已经换成百分点。括号里是标准误。星号按该系数自己的 p 值，没有做多重检验校正。这是相关，不是平均处理效应。")
@@ -1029,12 +1122,22 @@ if run or st.session_state.get("study_result") is not None:
       if preview.empty:
           st.caption("这次没有回归表。数值变量至少要有不同取值，而且通过估计窗的事件不能太少。")
       else:
-          st.dataframe(preview, hide_index=True, use_container_width=True)
+          st.dataframe(preview, hide_index=True, **_stretch(st.dataframe))
   with tab_note:
       st.caption("估计前的读法，用来对照你添加的变量。显著系数不能反过来证明机制已经成立。")
       st.markdown(result.theory_md)
   with tab_file:
       st.caption("CAR 表、回归表和 PNG 都来自同一次运行。演示样本和模拟试跑不能写进正文。")
+      st.download_button(
+          "下载本次结果打包",
+          data=_result_zip(result, cfg, figure_dir, Path(result.outputs["tables"])),
+          file_name="event_study.zip",
+          mime="application/zip",
+          type="primary",
+          help="里面有 tex、csv、png 和一份方法说明。",
+          **_stretch(st.download_button),
+          key="dl-zip",
+      )
       file_cols = st.columns(2)
       saved = Path(result.outputs["tables"])
       names = ["table_car.tex", "table_summary.tex", "table_regression.tex", "table_placebo.tex"]
@@ -1046,7 +1149,7 @@ if run or st.session_state.get("study_result") is not None:
                   data=file_path.read_text(encoding="utf-8"),
                   file_name=name,
                   mime="text/plain",
-                  use_container_width=True,
+                  **_stretch(st.download_button),
                   key=f"dl-{name}",
               )
       png_names = [
@@ -1067,7 +1170,7 @@ if run or st.session_state.get("study_result") is not None:
                   data=file_path.read_bytes(),
                   file_name=name,
                   mime="image/png",
-                  use_container_width=True,
+                  **_stretch(st.download_button),
                   key=f"dl-{name}",
               )
       car_tex = saved / "table_car.tex"
@@ -1076,8 +1179,8 @@ if run or st.session_state.get("study_result") is not None:
               st.code(car_tex.read_text(encoding="utf-8"), language="latex")
       window_csv = result.tests.to_csv(index=False).encode("utf-8-sig")
       event_csv = result.events.to_csv(index=False).encode("utf-8-sig")
-      file_cols[0].download_button("下载 CAR 窗口表 CSV", window_csv, "car_windows.csv", "text/csv", use_container_width=True, key="dl-windows-csv")
-      file_cols[1].download_button("下载事件层 CAR CSV", event_csv, "event_car.csv", "text/csv", use_container_width=True, key="dl-event-csv")
+      file_cols[0].download_button("下载 CAR 窗口表 CSV", window_csv, "car_windows.csv", "text/csv", **_stretch(st.download_button), key="dl-windows-csv")
+      file_cols[1].download_button("下载事件层 CAR CSV", event_csv, "event_car.csv", "text/csv", **_stretch(st.download_button), key="dl-event-csv")
       with st.expander("样本怎么筛出来的"):
           st.markdown(result.sample_log)
 else:
@@ -1110,6 +1213,6 @@ with st.expander("方法说明"):
     )
 
 st.markdown(
-    '<p class="site-footer">Part of <a href="https://eugenefinance.tech">EF Lab · eugenefinance.tech</a> · V0.3 · 仅供学习与研究，不构成投资建议。行情来自 AKShare 或你上传的文件。</p>',
+    '<p class="site-footer">Part of <a href="https://eugenefinance.tech">EF Lab · eugenefinance.tech</a> · V0.4 · 仅供学习与研究，不构成投资建议。行情来自 AKShare 或你上传的文件。</p>',
     unsafe_allow_html=True,
 )

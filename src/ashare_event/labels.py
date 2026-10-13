@@ -41,7 +41,9 @@ STRINGS = {
         "preferred_note": "平均 CAR 的星号来自首选检验，而不是横截面 t。横截面 t 在事件日重合或残差相关时会过高估计显著性。",
         "event_types": {
             "ai_disclosure": "AI 披露",
+            "ai_policy": "人工智能政策",
             "esg": "ESG",
+            "esg_guideline": "ESG 指引",
             "geopolitics": "地缘政治",
             "unspecified": "未分类",
         },
