@@ -24,9 +24,9 @@ logging.getLogger("fontTools").setLevel(logging.ERROR)
 from ashare_event.inference import kp_factor
 from ashare_event.labels import text
 
-BLUE = "#0072B2"
-VERMILLION = "#D55E00"
-BAND = "#0072B2"
+BLUE = "#1f4e79"
+VERMILLION = "#9b3a3a"
+BAND = "#1f4e79"
 
 
 def _save(fig, destination: Path) -> None:
@@ -121,6 +121,32 @@ def save_placebo(
     if language == "zh":
         return f"{name}。柱为安慰剂分布，竖线为实际平均累计异常收益。"
     return f"{name}. Bars are the placebo distribution and the vertical line is the actual mean CAR."
+
+
+def save_group_bars(
+    frame: pd.DataFrame,
+    destination: Path,
+    *,
+    title: str,
+    size: tuple[float, float],
+) -> None:
+    """Horizontal mean-CAR bars. Sign uses navy and brown, not red and green."""
+    _theme()
+    fig, ax = plt.subplots(figsize=size)
+    if frame.empty:
+        _save(fig, destination)
+        return
+    ordered = frame.sort_values("mean")
+    colors = ["#1f4e79" if value >= 0 else "#9b3a3a" for value in ordered["mean"]]
+    y = np.arange(len(ordered))
+    ax.barh(y, ordered["mean"], color=colors, xerr=1.96 * ordered["se"], ecolor="#8aa0b8", capsize=2)
+    ax.axvline(0, color="#8aa0b8", linewidth=0.7)
+    labels = [f"{name}{stars}" for name, stars in zip(ordered["label"], ordered["stars"], strict=True)]
+    ax.set_yticks(y, labels)
+    ax.set_xlabel("平均 CAR")
+    ax.set_title(title, loc="left", color="#1f4e79", fontsize=11)
+    fig.tight_layout()
+    _save(fig, destination)
 
 
 def write_captions(path: Path, captions: dict[str, str]) -> None:

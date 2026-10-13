@@ -48,53 +48,115 @@ FIELD_HELP = {
     "firm_name": "公司名称，方便辨认。名称里若还有「示例」，不会用它下载真实行情。",
 }
 NAME_OK = re.compile(r"^[A-Za-z\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff]{0,40}$")
+EXAMPLE_EVENTS = {
+    "ai_policy": [
+        {"code": "002230", "event_date": "2023-07-13", "event_type": "ai_policy", "industry": "软件", "firm_name": "科大讯飞"},
+        {"code": "688111", "event_date": "2023-07-13", "event_type": "ai_policy", "industry": "软件", "firm_name": "金山办公"},
+        {"code": "300418", "event_date": "2023-07-13", "event_type": "ai_policy", "industry": "互联网", "firm_name": "昆仑万维"},
+        {"code": "000977", "event_date": "2023-07-13", "event_type": "ai_policy", "industry": "计算机", "firm_name": "浪潮信息"},
+    ],
+    "esg_guide": [
+        {"code": "600519", "event_date": "2024-04-12", "event_type": "esg_guideline", "industry": "食品饮料", "firm_name": "贵州茅台"},
+        {"code": "601318", "event_date": "2024-04-12", "event_type": "esg_guideline", "industry": "非银金融", "firm_name": "中国平安"},
+        {"code": "600900", "event_date": "2024-04-12", "event_type": "esg_guideline", "industry": "公用事业", "firm_name": "长江电力"},
+        {"code": "601012", "event_date": "2024-04-12", "event_type": "esg_guideline", "industry": "电力设备", "firm_name": "隆基绿能"},
+    ],
+}
 
-st.set_page_config(page_title="A股事件研究", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="EF Lab | A股事件研究",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+LOGO = ROOT / "assets" / "eugene-finance-logo.jpg"
 
 
 def _apply_style() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background: #f4f1ea; }
+        html, body, [class*="css"] { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+        .stApp { background: #f4f7fb; color: #16324f; }
+        header[data-testid="stHeader"] { background: transparent; }
+        #MainMenu, footer, [data-testid="stToolbar"] { visibility: hidden; }
+        div[data-testid="stDecoration"] { display: none; }
+        .block-container { padding-top: 0.45rem; padding-bottom: 2.2rem; max-width: 1180px; }
         section[data-testid="stSidebar"] {
-            background: #fbfaf6;
-            border-right: 1px solid #e5e0d6;
+          background: #eef3f8;
+          border-right: 1px solid #d5dee8;
         }
+        section[data-testid="stSidebar"] > div { padding-top: 0.85rem; }
         section[data-testid="stSidebar"] h2 {
-            font-size: 0.92rem;
-            font-weight: 650;
-            color: #1f4b6e;
-            letter-spacing: 0.01em;
-            margin-top: 0.4rem;
-            padding-top: 0.85rem;
-            border-top: 1px solid #e6e1d8;
+          font-size: 0.72rem;
+          letter-spacing: 0.16em;
+          color: #5a6a7a;
+          font-weight: 600;
+          margin-top: 0.4rem;
+          padding-top: 0.85rem;
+          border-top: 1px solid #d5dee8;
         }
-        section[data-testid="stSidebar"] h2:first-of-type {
-            border-top: 0;
-            padding-top: 0;
+        section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] p { font-size: 0.86rem; }
+        div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
+          background: #ffffff;
+          border-color: #d5dee8;
         }
-        div[data-testid="stMetric"] {
-            background: #fffdf9;
-            border-radius: 14px;
-        }
-        div[data-testid="stTabs"] button[data-baseweb="tab"] {
-            font-weight: 600;
-        }
-        .stButton > button[kind="primary"] {
-            background: #1f4b6e;
-            border: 1px solid #1f4b6e;
-            border-radius: 10px;
-        }
-        .stButton > button[kind="primary"]:hover {
-            background: #163850;
-            border-color: #163850;
+        .stTabs [data-baseweb="tab-list"] { gap: 0.15rem; border-bottom: 1px solid #d5dee8; }
+        .stTabs [data-baseweb="tab"] { background: transparent; color: #5a6a7a; border-radius: 0; }
+        .stTabs [aria-selected="true"] { color: #1f4e79; border-bottom: 2px solid #1f4e79; }
+        div[data-testid="stAlert"] {
+          background: #f4f7fb;
+          border: 0;
+          border-left: 3px solid #1f4e79;
+          border-radius: 2px;
+          color: #16324f;
         }
         div[data-testid="stDataFrame"], div[data-testid="stDataEditor"] {
-            border: 1px solid #e6e1d6;
-            border-radius: 12px;
-            overflow: hidden;
-            background: white;
+          border: 1px solid #d5dee8;
+          border-radius: 2px;
+          background: #ffffff;
+        }
+        div[data-testid="stImage"] {
+          background: #ffffff;
+          border: 1px solid #d5dee8;
+          padding: 0.35rem;
+        }
+        .stButton > button[kind="primary"] {
+          background: #1f4e79;
+          border: 1px solid #1f4e79;
+        }
+        .brand h1 {
+          margin: 0;
+          color: #1f4e79;
+          font-size: 1.65rem;
+          font-weight: 650;
+          letter-spacing: -0.02em;
+          line-height: 1.25;
+        }
+        .brand .subtitle { margin: 0.35rem 0 0; color: #5a6a7a; font-size: 0.92rem; }
+        .kpi-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.55rem; margin: 0.4rem 0 0.7rem; }
+        .kpi {
+          background: #ffffff;
+          border: 1px solid #d5dee8;
+          border-radius: 8px;
+          padding: 0.62rem 0.75rem 0.55rem;
+          box-shadow: 0 1px 2px rgba(22, 50, 79, 0.05), 0 6px 16px rgba(22, 50, 79, 0.04);
+        }
+        .kpi span { display: block; font-size: 0.72rem; letter-spacing: 0.04em; color: #5a6a7a; }
+        .kpi strong {
+          display: block; margin-top: 0.18rem; font-size: 1.28rem; font-weight: 560;
+          font-variant-numeric: tabular-nums; color: #16324f;
+        }
+        .kpi.neg strong { color: #9b3a3a; }
+        .kpi.pos strong { color: #1d6b45; }
+        .site-footer {
+          margin-top: 1.6rem; padding-top: 0.75rem; border-top: 1px solid #d5dee8;
+          color: #5a6a7a; font-size: 0.82rem;
+        }
+        .site-footer a { color: #1f4e79; text-decoration: none; }
+        @media (max-width: 900px) {
+          .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          .brand h1 { font-size: 1.25rem; }
         }
         </style>
         """,
@@ -160,6 +222,15 @@ def _ensure_state() -> None:
 
 def _reset_editor() -> None:
     st.session_state.pop("event_editor", None)
+
+
+def _load_named_example(key: str) -> None:
+    frame = pd.DataFrame(EXAMPLE_EVENTS[key])
+    frame["event_date"] = pd.to_datetime(frame["event_date"])
+    st.session_state.custom_vars = []
+    st.session_state.event_grid = _align_grid(frame, [])
+    st.session_state.var_error = ""
+    _reset_editor()
 
 
 def _add_variable(name: str, kind: str) -> None:
@@ -300,11 +371,20 @@ base = load_config(config_path)
 _ensure_state()
 
 with st.sidebar:
-    st.header("1. 事件表")
+    st.image(str(LOGO), width=148)
+    st.caption("EF Lab · [eugenefinance.tech](https://eugenefinance.tech)")
+    st.header("事件")
     source = st.radio("事件从哪来", ["演示样本", "我的事件表"], key="event_source")
     import_error = ""
     if source == "我的事件表":
-        st.caption("标准列固定为证券代码、事件日期、事件类型、行业、公司名称。自定义变量会变成新列：数值列解释累计异常收益的差别，文本列只作标记。")
+        st.caption("标准列：code, event_date, event_type, industry, firm_name。示例：`002230,2023-07-13,ai_policy,软件,科大讯飞`。")
+        if st.button("载入示例：人工智能管理办法 2023-07-13", key="ex_ai"):
+            _load_named_example("ai_policy")
+            st.rerun()
+        if st.button("载入示例：可持续发展报告指引 2024-04-12", key="ex_esg"):
+            _load_named_example("esg_guide")
+            st.rerun()
+        st.caption("这两日是政策发布日的教学示例，不是各公司自己的公告。运行前请核对，结果不能直接写成公司事件研究。")
         for preset_name, preset_label in PRESET_VARIABLES:
             if preset_name not in {item["name"] for item in st.session_state.custom_vars}:
                 if st.button(f"加常用变量：{preset_label}", key=f"preset-{preset_name}"):
@@ -351,7 +431,7 @@ with st.sidebar:
             import_error = import_error or str(exc)
             st.error(import_error)
 
-    st.header("2. 纳入哪些行")
+    st.header("样本")
     industries: list[str] | None = None
     event_types: list[str] | None = None
     if event_ready is not None:
@@ -382,7 +462,7 @@ with st.sidebar:
     else:
         st.caption("先在标准表里写上代码和日期。")
 
-    st.header("3. 行情")
+    st.header("行情")
     if source == "演示样本":
         price_mode = "demo"
         st.caption("演示样本使用内置行情。")
@@ -407,7 +487,7 @@ with st.sidebar:
             help="前复权让分红送股前后的价格能比较，算收益率时用它。不复权会在除权日出现假的大跌。",
         )
         adjust = {"前复权": "qfq", "后复权": "hfq", "不复权": ""}[adjust_label]
-        st.caption("AKShare 只下载事件表里这些代码的日线，并写入 data/raw。已有文件不会覆盖。")
+        st.caption("来源是 AKShare 日线。交易日按基准指数的日历对齐，不是每家公司自己的成交日。前复权收盘价用来算简单收益率。非交易日的事件日向后顺延，最多 10 个日历日。")
     elif price_mode == "local":
         price_file = st.file_uploader("个股行情 CSV（代码、日期、收盘）", type=["csv"], key="prices_csv")
         market_file = st.file_uploader("指数行情 CSV（日期、收盘）", type=["csv"], key="market_csv")
@@ -422,7 +502,7 @@ with st.sidebar:
             except Exception as exc:
                 st.error(str(exc))
 
-    st.header("4. 窗口与回归")
+    st.header("窗口")
     estimation = _window_pair(
         "估计窗",
         base.estimation_window[0],
@@ -454,6 +534,7 @@ with st.sidebar:
         ):
             report_extra.append(preset)
     event_windows = list(dict.fromkeys([*report_extra, car_window]))
+    st.header("模型")
     model = st.radio(
         "收益模型",
         ["market", "market_adjusted"],
@@ -536,20 +617,29 @@ with st.sidebar:
         st.rerun()
 
 ready_count = 0 if event_ready is None else len(event_ready)
-head_left, head_right = st.columns([5, 2])
-with head_left:
-    st.markdown("## 事件研究")
-    st.caption("左侧改事件、窗口和行情。这里看累计异常收益、图，以及可以放进论文的文件。")
-with head_right:
-    if source == "演示样本":
-        st.badge("演示样本", color="orange")
-        st.caption("数字不能写入论文")
-    elif event_ready is None:
-        st.badge("等待事件", color="gray")
-        st.caption("写上代码和日期后再运行")
-    else:
-        st.badge(f"{ready_count} 个有效事件", color="green")
-        st.caption(f"{'市场模型' if model == 'market' else '市场调整'} · CAR [{car_window[0]}, {car_window[1]}]")
+logo_col, title_col = st.columns([1, 5], vertical_alignment="center")
+with logo_col:
+    st.image(str(LOGO), width=112)
+with title_col:
+    st.markdown(
+        """
+<div class="brand">
+  <p class="kicker">EUGENE FINANCE</p>
+  <h1>EF Lab · A 股事件研究流水线</h1>
+  <p class="subtitle">Interactive Event Study Pipeline for A-Shares · 仅供学习与研究，不构成投资建议</p>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+if source == "演示样本":
+    st.badge("演示样本", color="orange")
+elif event_ready is None:
+    st.badge("等待事件", color="gray")
+else:
+    st.badge(
+        f"{ready_count} 个有效事件 · {'市场模型' if model == 'market' else '市场调整'} · CAR [{car_window[0]}, {car_window[1]}]",
+        color="green",
+    )
 
 if source == "演示样本":
     st.info("演示样本用来看流程。换成自己的研究时，在左侧切到「我的事件表」。")
@@ -582,7 +672,7 @@ if run:
     cfg.include_peer_count = include_peer
     cfg.placebo_draws = placebo_draws
     validate_windows(cfg)
-    with st.spinner("正在估计。"):
+    with st.spinner("正在计算累计异常收益、路径和回归…"):
         try:
             result = run_study(
                 cfg,
@@ -605,43 +695,84 @@ if run:
         st.error("回归窗没有进入结果表。")
         st.stop()
     primary = primary.iloc[0]
-    metric_n, metric_mean, metric_pref, metric_t = st.columns(4)
-    metric_n.metric("事件数", int(primary["n"]), border=True, help="通过估计窗、并且事件窗没有缺天的公司-事件。")
-    metric_mean.metric("平均 CAR", f"{primary['mean'] * cfg.return_scale:.3f}", border=True, help="单位是百分点。1 表示 1 个百分点。")
-    metric_pref.metric("首选检验", str(primary["preferred"]).upper(), border=True, help="星号来自这一检验，不来自横截面 t。")
     preferred_t = {"portfolio": primary["t_portfolio"], "kp": primary["t_kp"], "bmp": primary["t_bmp"]}[primary["preferred"]]
-    metric_t.metric("首选 t", f"{preferred_t:.2f}", border=True)
+    car_value = float(primary["mean"]) * cfg.return_scale
+    tone = "neg" if car_value < 0 else "pos"
+    st.markdown(
+        f"""
+<div class="kpi-row">
+  <div class="kpi"><span>事件数</span><strong>{int(primary["n"])}</strong></div>
+  <div class="kpi {tone}"><span>平均 CAR（百分点）</span><strong>{car_value:.3f}</strong></div>
+  <div class="kpi"><span>首选检验</span><strong>{str(primary["preferred"]).upper()}</strong></div>
+  <div class="kpi {tone}"><span>首选 t</span><strong>{preferred_t:.2f}</strong></div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
     preferred_note = {
         "bmp": "事件日比较分散，所以用 BMP。它允许事件窗的波动和估计窗不一样。",
         "kp": "公司之间的估计窗残差相关较高，所以用 KP。它在 BMP 的基础上把 t 缩小。",
         "portfolio": "很多事件落在同一天，所以用等权组合的时间序列检验。这一天是一次共同冲击。",
     }[primary["preferred"]]
-    st.caption(
-        f"窗口 [{car_window[0]}, {car_window[1]}]。{preferred_note}"
-    )
+    st.caption(f"窗口 [{car_window[0]}, {car_window[1]}]。星号来自首选检验。{preferred_note}")
+    from ashare_event.figures import save_group_bars
+    from ashare_event.inference import mean_t
+    from ashare_event.tables import stars as star_mark
+    from ashare_event.config import window_suffix
+
+    car_col = f"car_{window_suffix(*car_window)}"
+    figure_dir = Path(result.outputs["figures"])
+
+    def _grouped(column: str) -> pd.DataFrame:
+        rows = []
+        if result.events.empty or car_col not in result.events.columns or column not in result.events.columns:
+            return pd.DataFrame(columns=["label", "mean", "se", "stars", "n"])
+        for name, part in result.events.groupby(column):
+            values = pd.to_numeric(part[car_col], errors="coerce").dropna().to_numpy(dtype=float)
+            if values.size < 2:
+                continue
+            mean, _t, p_value = mean_t(values)
+            se = float(values.std(ddof=1) / np.sqrt(values.size))
+            rows.append({"label": str(name), "mean": mean * cfg.return_scale, "se": se * cfg.return_scale, "stars": star_mark(p_value), "n": int(values.size)})
+        return pd.DataFrame(rows)
+
+    industry_groups = _grouped("industry")
+    type_groups = _grouped("event_type")
+    if not industry_groups.empty:
+        save_group_bars(industry_groups, figure_dir / "fig_car_by_industry.png", title="按行业的平均 CAR", size=tuple(cfg.figure_size))
+    if not type_groups.empty:
+        save_group_bars(type_groups, figure_dir / "fig_car_by_type.png", title="按事件类型的平均 CAR", size=tuple(cfg.figure_size))
     tab_fig, tab_table, tab_note, tab_file = st.tabs(["图", "窗口表", "机制备忘", "导出"])
     with tab_fig:
-        figure = Path(result.outputs["figures"]) / "fig_car_path.png"
-        if figure.exists():
-            st.image(str(figure), caption="横轴是相对事件日的交易日，纵轴是平均累计异常收益。竖线为事件日。")
-        else:
-            st.info("这次没有画出路径图。")
+        path_fig = figure_dir / "fig_car_path.png"
+        industry_fig = figure_dir / "fig_car_by_industry.png"
+        type_fig = figure_dir / "fig_car_by_type.png"
+        left_fig, right_fig = st.columns(2)
+        if path_fig.exists():
+            left_fig.image(str(path_fig), caption="CAR 路径。阴影是 95% 区间，竖线是事件日。")
+        if industry_fig.exists():
+            right_fig.image(str(industry_fig), caption="按行业。误差线是 95% 区间，星号来自该组的横截面 t。")
+        elif type_fig.exists():
+            right_fig.image(str(type_fig), caption="按事件类型。误差线是 95% 区间。")
+        if type_fig.exists() and industry_fig.exists():
+            st.image(str(type_fig), caption="按事件类型。星号：* 10%，** 5%，*** 1%。")
         if not result.placebos:
-            st.caption("左侧勾选「做安慰剂」后，这里会多一张对照图。")
+            st.caption("左侧勾选「做安慰剂」后，这里出现安慰剂分布。")
         for mode_name in result.placebos:
-            picture = Path(result.outputs["figures"]) / f"fig_placebo_{mode_name}.png"
+            picture = figure_dir / f"fig_placebo_{mode_name}.png"
             if picture.exists():
-                st.image(str(picture), caption="柱是挪走事件日之后的结果，竖线是真实日期。")
+                st.image(str(picture), caption="安慰剂直方图。柱是挪走事件日后的平均 CAR，竖线是真实日期。")
     with tab_table:
-        st.caption("每一行是一个累加窗口。平均 CAR 已换成百分点。看「首选」列对应的 t。")
+        st.caption("每一行是一个累加窗口。平均 CAR 已换成百分点。显著性按首选检验标注。")
         show = result.tests.copy()
         show["平均 CAR"] = (show["mean"] * cfg.return_scale).round(3)
+        show["显著性"] = show["p_preferred"].map(star_mark)
         for column, label in [("t_cs", "横截面 t"), ("t_bmp", "BMP t"), ("t_kp", "KP t"), ("t_portfolio", "组合 t")]:
             show[label] = show[column].round(2)
         show["窗口"] = show.apply(lambda row: f"[{int(row.t1)}, {int(row.t2)}]", axis=1)
         show["首选"] = show["preferred"].map({"bmp": "BMP", "kp": "KP", "portfolio": "组合"})
         st.dataframe(
-            show[["窗口", "n", "平均 CAR", "横截面 t", "BMP t", "KP t", "组合 t", "首选"]].rename(columns={"n": "N"}),
+            show[["窗口", "n", "平均 CAR", "显著性", "横截面 t", "BMP t", "KP t", "组合 t", "首选"]].rename(columns={"n": "N"}),
             hide_index=True,
             use_container_width=True,
         )
@@ -649,7 +780,7 @@ if run:
         st.caption("估计前的读法，用来对照你添加的变量。显著系数不能反过来证明机制已经成立。")
         st.markdown(result.theory_md)
     with tab_file:
-        st.caption("这些 tex 给论文直接引入。演示样本和模拟试跑不能写进正文。")
+        st.caption("CAR 表、回归表和 PNG 都来自同一次运行。演示样本和模拟试跑不能写进正文。")
         file_cols = st.columns(2)
         saved = Path(result.outputs["tables"])
         names = ["table_car.tex", "table_summary.tex", "table_regression.tex", "table_placebo.tex"]
@@ -662,6 +793,26 @@ if run:
                     file_name=name,
                     mime="text/plain",
                     use_container_width=True,
+                    key=f"dl-{name}",
+                )
+        png_names = [
+            "fig_car_path.png",
+            "fig_car_by_industry.png",
+            "fig_car_by_type.png",
+            "fig_placebo_in_time.png",
+            "fig_placebo_in_space.png",
+        ]
+        png_cols = st.columns(2)
+        for index, name in enumerate(png_names):
+            file_path = figure_dir / name
+            if file_path.exists():
+                png_cols[index % 2].download_button(
+                    f"下载 {name}",
+                    data=file_path.read_bytes(),
+                    file_name=name,
+                    mime="image/png",
+                    use_container_width=True,
+                    key=f"dl-{name}",
                 )
         with st.expander("样本怎么筛出来的"):
             st.markdown(result.sample_log)
@@ -676,3 +827,21 @@ else:
     with step_c.container(border=True):
         st.markdown("**3. 看结果**")
         st.caption("运行后在图、窗口表、机制备忘和导出之间切换。平均 CAR 的 1 是 1 个百分点。")
+
+with st.expander("方法说明"):
+    st.markdown(
+        """
+市场模型在估计窗里拟合每家公司自己的截距和斜率，事件窗里的残差才记为异常收益。估计窗必须整段落在事件窗和路径窗的左边。一旦重叠，事件当天会进入斜率，异常收益会被压向 0。这是前视，不是更干净的估计。
+
+交易日按基准指数的日历数，不是按每家公司自己有成交的日子数。缺一天的事件窗会被整段丢掉。AKShare 默认用前复权收盘价计算简单收益率；不复权会在除权日制造假的大跌。
+
+同时看很多窗口、很多行业和很多事件类型，会提高“至少有一个显著”的机会。星号是单个检验的标注，不是已经做过多重检验校正。横截面 t 在事件日扎在同一天时会把显著性说高。这时看组合时间序列检验。
+
+回归系数是累计异常收益和变量之间的相关。它不是平均处理效应。
+        """
+    )
+
+st.markdown(
+    '<p class="site-footer">Part of <a href="https://eugenefinance.tech">EF Lab · eugenefinance.tech</a> · 仅供学习与研究，不构成投资建议。行情来自 AKShare 或你上传的文件。</p>',
+    unsafe_allow_html=True,
+)
