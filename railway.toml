@@ -1,8 +1,8 @@
 [build]
-builder = "NIXPACKS"
+builder = "RAILPACK"
 
 [deploy]
-startCommand = "streamlit run app/streamlit_app.py --server.port ${PORT:-8501} --server.address 0.0.0.0 --server.headless true"
+startCommand = "python app.py"
 healthcheckPath = "/"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"

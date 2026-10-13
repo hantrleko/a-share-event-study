@@ -7,6 +7,7 @@ __pycache__/
 venv/
 *.egg-info/
 .streamlit/secrets.toml
+.railway/
 
 # Immutable downloads and derived analysis files. Regenerate; do not commit prices.
 data/raw/prices/**
