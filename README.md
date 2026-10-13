@@ -4,6 +4,10 @@
 
 市场模型异常收益是相对基准的统计偏离，不是平均处理效应。回归系数是相关关系。信号、合法性、制度同构写在估计前的候选备忘里，不能当成已经识别的机制。
 
+## 在线使用
+
+打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。
+
 ## 先跑演示
 
 在项目目录打开 PowerShell：
