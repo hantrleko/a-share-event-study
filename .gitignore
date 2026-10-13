@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+.streamlit/secrets.toml
+
+# Immutable downloads and derived analysis files. Regenerate; do not commit prices.
+data/raw/prices/**
+!data/raw/prices/.gitkeep
+data/raw/index/**
+!data/raw/index/.gitkeep
+data/intermediate/**
+!data/intermediate/.gitkeep
+data/processed/**
+!data/processed/.gitkeep
+output/
+paper/tabs/**
+!paper/tabs/.gitkeep
+paper/figs/**
+!paper/figs/.gitkeep

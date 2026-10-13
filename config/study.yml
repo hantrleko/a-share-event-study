@@ -1,0 +1,78 @@
+# ============================================================
+# DECISIONS LOG  (review before any number enters a paper)
+# ============================================================
+# Estimand:        Cross-sectional mean cumulative abnormal return
+#                  around a firm event. This is a market-model
+#                  benchmark, not an average treatment effect.
+# Unit:            firm-event (CAR); firm-event-day (AR path)
+# Treatment:       an event date supplied by the user. No control
+#                  group is implied.
+# Outcome:         simple return minus the market-model prediction
+# Identification:  none beyond the statistical benchmark. Do not
+#                  describe coefficients as causal.
+# Cluster:         firm_id. If event dates coincide, prefer the
+#                  portfolio time-series test over the cross-section t.
+# Inference:       BMP is the default dispersed-date test. Kolari-
+#                  Pynnonen adjusts BMP when estimation residuals
+#                  are cross-sectionally correlated. Cross-sectional
+#                  t is reported and is not the preferred test.
+# Returns:         simple returns from 前复权 close when using AKShare.
+# Calendar:        exchange dates (benchmark index), not each firm's
+#                  own trading-day count.
+# Alignment:       event date maps to the first trading day on or
+#                  after the recorded date, within 10 calendar days.
+# Windows:         estimation [-250, -31] must sit strictly before
+#                  the path and every CAR window.
+# Stars:           * 10%, ** 5%, *** 1%.
+# Scale:           tables and figures multiply returns by return_scale
+#                  (default 100, so 0.01 displays as 1). CSV stores
+#                  decimal returns.
+# ASSUMPTIONS [HUMAN: please confirm]:
+#   - 前复权 is the price convention you want.
+#   - A non-trading announcement date should roll forward.
+#   - firm_id (not the event date) is the dependence cluster.
+#   - Missing a day inside the CAR window drops that CAR.
+# ============================================================
+
+project_name: a-share-event-study
+seed: 20240101
+mode: demo   # demo | local | akshare
+language: zh # zh | en
+
+model: market  # market | market_adjusted
+benchmark: "000300"
+adjust: qfq
+
+estimation_window: [-250, -31]
+event_windows:
+  - [-1, 1]
+  - [-3, 3]
+  - [-5, 5]
+path_window: [-10, 10]
+regression_window: [-1, 1]
+min_estimation_obs: 80
+require_complete_window: true
+
+cluster: firm_id
+covariates: [signal_cost, size_log, legitimacy_gap]
+include_peer_count: false
+return_scale: 100
+
+placebo_draws: 200
+placebo_offsets: [-180, -40]
+placebo_modes: [in_time, in_space]
+
+rbar_min_periods: 30
+portfolio_min_share: 0.5
+figure_size: [6.5, 4.0]
+
+events_file: data/examples/events_template.csv
+prices_file: null
+market_file: null
+
+paths:
+  tables: paper/tabs
+  figures: paper/figs
+  processed: data/processed
+  logs: output/logs
+  theory: output/theory

@@ -1,0 +1,4 @@
+firm_id,code,event_date,event_type,industry,firm_name,signal_cost,size_log,legitimacy_gap
+DEMO_A,000001,2023-06-15,ai_disclosure,电子,示例公司A,0.80,16.2,0.10
+DEMO_B,000002,2023-07-03,esg,银行,示例公司B,0.20,17.1,0.70
+DEMO_C,600000,2023-07-03,geopolitics,医药,示例公司C,0.40,15.4,0.30

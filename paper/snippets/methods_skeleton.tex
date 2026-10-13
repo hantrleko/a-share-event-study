@@ -1,0 +1,35 @@
+% 方法段骨架。数字不要手写，用 \input{tabs/table_car.tex}。
+% 需要 booktabs 与 threeparttable。
+
+\section{实证设计}
+
+我们以市场模型度量事件窗内的累计异常收益。
+对每家公司，在事件日前的估计窗内拟合
+\( R_{it} = \alpha_i + \beta_i R_{mt} + \varepsilon_{it} \)，
+事件窗内的异常收益为 \( AR_{it} = R_{it} - \hat\alpha_i - \hat\beta_i R_{mt} \)。
+估计窗必须落在所有报告窗口之前，避免事件日本身进入 \(\beta\) 的估计。
+收益使用简单收益率；行情为前复权收盘价。
+非交易日的事件日顺延到其后十个日历日内的第一个交易日。
+
+横截面 \(t\) 统计量假设事件互相独立，只作对照。
+事件日分散时，首选 Boehmer, Musumeci and Poulsen (1991) 的标准化检验；
+估计窗残差存在截面相关时，再用 Kolari and Pynnönen (2010) 的相关调整。
+若半数以上事件落在同一天，首选等权组合的时间序列检验，因为这一天是一次共同冲击，不是 \(N\) 次独立冲击。
+平均 CAR 上的星号来自首选检验。
+
+回归是事件层累计异常收益对披露或公司特征的横截面关联，标准误按公司聚类。
+它不是平均处理效应。
+信号、合法性与制度同构只作为估计前的可区分预测，写在 \texttt{output/theory/candidate\_mechanisms.md}；
+结果出来之后再按完整的系数模式取舍，包括不显著的列。
+
+\input{tabs/table_car.tex}
+\input{tabs/table_summary.tex}
+\input{tabs/table_regression.tex}
+\input{tabs/table_placebo.tex}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.85\textwidth]{figs/fig_car_path.pdf}
+\caption{事件路径上的平均累计异常收益。说明见 \texttt{figs/captions.tex}。}
+\label{fig:car_path}
+\end{figure}

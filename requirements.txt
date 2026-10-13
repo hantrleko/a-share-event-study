@@ -1,0 +1,10 @@
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+statsmodels>=0.14
+matplotlib>=3.8
+PyYAML>=6.0
+pyarrow>=14
+pyfixest>=0.20
+akshare>=1.14
+streamlit>=1.32
