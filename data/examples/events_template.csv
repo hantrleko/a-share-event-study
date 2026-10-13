@@ -1,4 +1,9 @@
-firm_id,code,event_date,event_type,industry,firm_name,signal_cost,size_log,legitimacy_gap
-DEMO_A,000001,2023-06-15,ai_disclosure,电子,示例公司A,0.80,16.2,0.10
-DEMO_B,000002,2023-07-03,esg,银行,示例公司B,0.20,17.1,0.70
-DEMO_C,600000,2023-07-03,geopolitics,医药,示例公司C,0.40,15.4,0.30
+code,event_date,event_type,industry,firm_name,signal_cost
+002230,2023-07-13,ai_policy,软件,科大讯飞（示例）,
+688111,2023-07-13,ai_policy,软件,金山办公（示例）,
+300418,2023-07-13,ai_policy,互联网,昆仑万维（示例）,
+000977,2023-07-13,ai_policy,计算机,浪潮信息（示例）,
+600519,2024-04-12,esg_guideline,食品饮料,贵州茅台（示例）,
+601318,2024-04-12,esg_guideline,非银金融,中国平安（示例）,
+600900,2024-04-12,esg_guideline,公用事业,长江电力（示例）,
+601012,2024-04-12,esg_guideline,电力设备,隆基绿能（示例）,

@@ -149,6 +149,34 @@ def save_group_bars(
     _save(fig, destination)
 
 
+GROUP_COLORS = ("#1f4e79", "#1d6b45", "#9b3a3a", "#5a6a7a", "#8aa0b8", "#3d4c5c")
+
+
+def save_grouped_paths(frame: pd.DataFrame, destination: Path, *, size: tuple[float, float]) -> None:
+    """One cumulative-CAR path per group, each with a standard-error band."""
+    _theme()
+    fig, ax = plt.subplots(figsize=size)
+    if frame.empty:
+        _save(fig, destination)
+        return
+    ax.axhline(0, color="#8aa0b8", linewidth=0.6)
+    ax.axvline(0, color="#9b3a3a", linewidth=0.9)
+    for index, (name, part) in enumerate(frame.groupby("group", sort=False)):
+        color = GROUP_COLORS[index % len(GROUP_COLORS)]
+        order = part.sort_values("rel_day")
+        x_values = order["rel_day"].to_numpy()
+        mean = order["mean"].to_numpy(dtype=float)
+        band = 1.96 * order["se"].to_numpy(dtype=float)
+        ax.plot(x_values, mean, color=color, linewidth=1.5, label=str(name))
+        ok = np.isfinite(band)
+        ax.fill_between(x_values[ok], (mean - band)[ok], (mean + band)[ok], color=color, alpha=0.12, linewidth=0)
+    ax.set_xlabel("相对事件日的交易日")
+    ax.set_ylabel("平均 CAR")
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    _save(fig, destination)
+
+
 def write_captions(path: Path, captions: dict[str, str]) -> None:
     lines = ["% Captions produced by the pipeline. Edit the paper, not these sentences, if a number changes.", ""]
     for key, caption in captions.items():
