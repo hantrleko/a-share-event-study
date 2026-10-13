@@ -1,0 +1,13 @@
+.git
+.venv
+venv
+**/__pycache__
+**/*.pyc
+output
+data/raw
+data/intermediate
+data/processed
+paper/tabs
+paper/figs
+.railway
+.streamlit/secrets.toml

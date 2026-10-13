@@ -196,6 +196,7 @@ def run_study(
     events_frame: pd.DataFrame | None = None,
     prices_frame: pd.DataFrame | None = None,
     market_frame: pd.DataFrame | None = None,
+    on_step=None,
 ) -> StudyResult:
     from ashare_event.config import validate_windows
 
@@ -205,6 +206,12 @@ def run_study(
             cfg.event_windows = [*cfg.event_windows, cfg.regression_window]
         validate_windows(cfg)
     rng = np.random.default_rng(cfg.seed)
+
+    def _step(key: str) -> None:
+        if on_step is not None:
+            on_step(key)
+
+    _step("inputs")
     filtered, prices, market, simulated, loaded_n = _load_inputs(
         cfg,
         rng,
@@ -214,6 +221,7 @@ def run_study(
         prices_frame=prices_frame,
         market_frame=market_frame,
     )
+    _step("estimate")
     estimation = estimate_events(
         filtered,
         prices,
@@ -233,6 +241,7 @@ def run_study(
     events["year"] = pd.to_datetime(events["event_date"]).dt.year.astype(int)
     suffix = window_suffix(*cfg.regression_window)
     r_bar = mean_residual_correlation(estimation.panel, events["event_id"], cfg.rbar_min_periods)
+    _step("tests")
     rows = []
     for window in cfg.event_windows:
         rows.append(
@@ -260,6 +269,7 @@ def run_study(
     actual = float(events[f"car_{suffix}"].mean())
     placebos = {}
     if run_placebo and cfg.placebo_draws > 0:
+        _step("placebo")
         placebos = run_placebos(events, prices, market, cfg, actual, rng)
     theory = render_theory(
         sorted(events["event_type"].dropna().unique().tolist()),
@@ -281,6 +291,7 @@ def run_study(
         r_bar=r_bar,
     )
     if export:
+        _step("export")
         result.outputs = export_result(result)
     if cfg.verbose:
         primary = tests[(tests.t1 == cfg.regression_window[0]) & (tests.t2 == cfg.regression_window[1])].iloc[0]

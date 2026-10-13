@@ -31,18 +31,65 @@ BAND = "#1f4e79"
 
 def _save(fig, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(destination, bbox_inches="tight")
+    png = destination.with_suffix(".png") if destination.suffix.lower() == ".pdf" else destination
+    fig.savefig(png, bbox_inches="tight", dpi=150)
     if destination.suffix.lower() == ".pdf":
-        fig.savefig(destination.with_suffix(".png"), bbox_inches="tight", dpi=150)
+        try:
+            fig.savefig(destination, bbox_inches="tight")
+        except Exception:
+            logging.getLogger("ashare_event.figures").warning("PDF 导出失败，已保留 PNG。", exc_info=True)
     plt.close(fig)
 
 
+def _cjk_family() -> str:
+    """Family name of a font that can draw Chinese labels, if one is installed."""
+    from matplotlib import font_manager
+
+    preferred = (
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "Noto Sans SC",
+        "Source Han Sans SC",
+        "Microsoft YaHei",
+        "SimHei",
+        "PingFang SC",
+    )
+    installed = {font.name for font in font_manager.fontManager.ttflist}
+    for name in preferred:
+        if name in installed:
+            return name
+    roots = [Path("/usr/share/fonts"), Path("/usr/local/share/fonts")]
+    for root in roots:
+        if not root.exists():
+            continue
+        for pattern in ("NotoSansCJK*.ttc", "NotoSansCJK*.otf", "NotoSansSC*.otf", "NotoSansSC*.ttf"):
+            matches = sorted(root.rglob(pattern))
+            if not matches:
+                continue
+            try:
+                font_manager.fontManager.addfont(str(matches[0]))
+            except (RuntimeError, OSError, ValueError):
+                continue
+            return font_manager.FontProperties(fname=str(matches[0])).get_name()
+    return "DejaVu Sans"
+
+
 def _theme() -> None:
+    family = _cjk_family()
     plt.rcParams.update(
         {
             "font.size": 11,
             "axes.unicode_minus": False,
-            "font.sans-serif": ["Microsoft YaHei", "SimHei", "DejaVu Sans"],
+            "font.family": "sans-serif",
+            "font.sans-serif": [
+                family,
+                "Noto Sans CJK SC",
+                "Noto Sans CJK JP",
+                "Noto Sans SC",
+                "Microsoft YaHei",
+                "SimHei",
+                "DejaVu Sans",
+            ],
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
             "axes.spines.top": False,

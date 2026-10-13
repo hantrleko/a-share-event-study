@@ -6,7 +6,7 @@
 
 ## 在线使用
 
-打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。当前版本 V0.2。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。
+打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。当前版本 V0.3。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。
 
 ## 先跑演示
 
@@ -31,7 +31,7 @@ streamlit run app/streamlit_app.py
 
 交互页左侧就是全部输入。事件表的标准列是固定的：证券代码、事件日期、事件类型、行业、公司名称。要放进回归的量在左侧「加入变量」，会变成同一张表里的新列。已有 CSV 只要用这些标准列名，或常见中文列名（证券代码、公告日期、事件类型、行业），就可以导入。
 
-切到「我的事件表」后，可以下载带两套示例事件的 CSV，或只下载当前表头。示例是政策发布日，公司名带「示例」，AKShare 会拒绝下载。核对后再删掉这两个字。命令行仍可读 `config/study.yml`。
+切到「我的事件表」后，可以下载带两套示例事件的 CSV，或只下载当前表头。示例是政策发布日，公司名带「示例」。名称里还有这两个字时，运行按钮会停用，AKShare 也不会下载。核对后再删掉。命令行仍可读 `config/study.yml`。
 
 表在 `paper/tabs/*.tex`，图在 `paper/figs/*.pdf`。论文里 `\input` 这些 tex，不要手抄数字。方法段骨架在 `paper/snippets/methods_skeleton.tex`。样本怎么被筛掉，写在 `output/logs/sample_log.md`。
 

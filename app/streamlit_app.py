@@ -29,6 +29,7 @@ from ashare_event.schema import (
     rename_to_standard,
 )
 from ashare_event.simulate import simulate
+from ashare_event.tables import stars as star_mark
 
 PRESET_VARIABLES = (
     ("signal_cost", "信号成本"),
@@ -79,8 +80,12 @@ def _apply_style() -> None:
         html, body, [class*="css"] { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
         .stApp { background: #f4f7fb; color: #16324f; }
         header[data-testid="stHeader"] { background: transparent; }
-        #MainMenu, footer, [data-testid="stToolbar"] { visibility: hidden; }
-        div[data-testid="stDecoration"] { display: none; }
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stAppDeployButton"],
+        .stAppDeployButton,
+        .stDeployButton,
+        #MainMenu { display: none !important; }
         .block-container { padding-top: 0.45rem; padding-bottom: 2.2rem; max-width: 1180px; }
         section[data-testid="stSidebar"] {
           background: #eef3f8;
@@ -167,11 +172,31 @@ def _apply_style() -> None:
   box-shadow: 0 1px 2px rgba(22, 50, 79, 0.05);
 }
 .lesson strong { display: block; color: #1f4e79; margin-bottom: 0.35rem; font-size: 0.95rem; }
-.lesson p { margin: 0; color: #3d4c5c; font-size: 0.92rem; line-height: 1.6; }
+        .lesson p { margin: 0; color: #3d4c5c; font-size: 0.92rem; line-height: 1.6; }
+        .window-row {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 0.55rem;
+          margin: 0.2rem 0 0.7rem;
+        }
+        .window-row article {
+          background: #ffffff;
+          border: 1px solid #d5dee8;
+          border-radius: 8px;
+          padding: 0.7rem 0.8rem 0.65rem;
+          box-shadow: 0 1px 2px rgba(22, 50, 79, 0.05);
+        }
+        .window-row strong { display: block; color: #5a6a7a; font-size: 0.78rem; font-weight: 600; }
+        .window-row b {
+          display: block; margin-top: 0.15rem; color: #16324f; font-size: 1.2rem; font-weight: 560;
+          font-variant-numeric: tabular-nums;
+        }
+        .window-row span { display: block; margin-top: 0.2rem; color: #5a6a7a; font-size: 0.78rem; }
         @media (max-width: 900px) {
           .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
           .brand h1 { font-size: 1.25rem; }
           .lesson { grid-template-columns: 1fr; }
+          .window-row { grid-template-columns: 1fr; }
         }
         </style>
         """,
@@ -253,6 +278,56 @@ def _drop_close_events(frame: pd.DataFrame, window: tuple[int, int]) -> pd.DataF
                 keep.append(idx)
                 last = row["_when"]
     return work.loc[keep].drop(columns="_when")
+
+
+def _has_example_name(frame: pd.DataFrame | None) -> bool:
+    if frame is None or frame.empty or "firm_name" not in frame.columns:
+        return False
+    return bool(frame["firm_name"].astype(str).str.contains("示例").any())
+
+
+def _stat_text(value) -> str:
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number):
+        return "—"
+    return f"{float(number):.2f}"
+
+
+def _regression_preview(models: list[dict]) -> pd.DataFrame:
+    from ashare_event.labels import coef_label
+
+    if not models:
+        return pd.DataFrame()
+    order: list[str] = []
+    for model in models:
+        for term in model["terms"]:
+            if term not in order and not str(term).startswith("C("):
+                order.append(str(term))
+    rows: list[dict] = []
+    for term in order:
+        coef_row = {"项": coef_label("zh", term)}
+        se_row = {"项": ""}
+        for model in models:
+            title = model["title"]
+            if term not in model["b"]:
+                coef_row[title] = ""
+                se_row[title] = ""
+                continue
+            coef_row[title] = f"{model['b'][term]:.3f}{star_mark(model['p'][term])}"
+            se_row[title] = f"({model['se'][term]:.3f})"
+        rows.extend([coef_row, se_row])
+    extras = [
+        ("观测数", [str(model["n"]) for model in models]),
+        ("聚类数", ["—" if not model["g"] else str(model["g"]) for model in models]),
+        ("行业固定效应", ["是" if model["fe_industry"] else "否" for model in models]),
+        ("年份固定效应", ["是" if model["fe_year"] else "否" for model in models]),
+    ]
+    for label, values in extras:
+        row = {"项": label}
+        for model, value in zip(models, values, strict=True):
+            row[model["title"]] = value
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _overlap_counts(frame: pd.DataFrame, window: tuple[int, int]) -> tuple[int, int]:
@@ -661,8 +736,11 @@ with st.sidebar:
             st.error(window_error)
 
     missing = []
+    example_blocked = source == "我的事件表" and _has_example_name(event_ready)
     if source == "我的事件表" and event_ready is None:
         missing.append("事件表")
+    if example_blocked:
+        missing.append("示例行")
     if price_mode == "local" and (prices_frame is None or market_frame is None):
         missing.append("本地行情")
     if window_error or import_error:
@@ -670,6 +748,8 @@ with st.sidebar:
     run = st.button("运行并导出", type="primary", disabled=bool(missing))
     if source == "我的事件表" and event_ready is None:
         st.caption("还差：至少一行证券代码和事件日期。")
+    if example_blocked:
+        st.caption("公司名里还有「示例」，运行已停用。这是政策日示例，不是公司公告。核对后删掉「示例」再运行。")
     if source == "我的事件表" and st.button("清空事件表", key="clear_grid"):
         st.session_state.custom_vars = []
         st.session_state.event_grid = _blank_grid([])
@@ -685,7 +765,7 @@ with title_col:
     st.markdown(
         """
 <div class="brand">
-  <p class="kicker">V0.2 · EUGENE FINANCE</p>
+  <p class="kicker">V0.3 · EUGENE FINANCE</p>
   <h1>EF Lab · A 股事件研究流水线</h1>
   <p class="subtitle">Interactive Event Study Pipeline for A-Shares · 仅供学习与研究，不构成投资建议</p>
 </div>
@@ -694,6 +774,8 @@ with title_col:
     )
 if source == "演示样本":
     st.badge("演示样本", color="orange")
+elif example_blocked:
+    st.badge(f"{ready_count} 个已载入事件 · 含示例，还不能运行", color="orange")
 elif event_ready is None:
     st.badge("等待事件", color="gray")
 else:
@@ -749,7 +831,18 @@ if run or st.session_state.get("study_result") is not None:
     sent_events = event_ready
     if source != "演示样本" and drop_overlap and event_ready is not None:
         sent_events = _drop_close_events(event_ready, car_window)
-    with st.spinner("正在计算累计异常收益、路径和回归…"):
+    with st.status("正在计算累计异常收益…", expanded=True) as status:
+        labels = {
+            "inputs": "读取事件和行情",
+            "estimate": "估计窗与事件窗",
+            "tests": "窗口检验与路径",
+            "placebo": "安慰剂",
+            "export": "回归表与导出",
+        }
+
+        def _on_step(key: str) -> None:
+            status.update(label=labels.get(key, key))
+
         try:
             result = run_study(
                 cfg,
@@ -761,10 +854,13 @@ if run or st.session_state.get("study_result") is not None:
                 events_frame=None if source == "演示样本" else sent_events,
                 prices_frame=prices_frame,
                 market_frame=market_frame,
+                on_step=_on_step,
             )
         except Exception as exc:
+            status.update(label="没有跑完", state="error")
             st.error(str(exc))
             st.stop()
+        status.update(label="计算完成", state="complete", expanded=False)
         st.session_state.study_result = result
         st.session_state.study_window = car_window
         st.session_state.study_source = source
@@ -801,18 +897,22 @@ if run or st.session_state.get("study_result") is not None:
       "portfolio": "很多事件落在同一天，所以用等权组合的时间序列检验。这一天是一次共同冲击。",
   }[primary["preferred"]]
   st.caption(f"窗口 [{car_window[0]}, {car_window[1]}]。星号来自首选检验。{preferred_note}")
+  window_cards = []
+  for row in result.tests.itertuples(index=False):
+      mark = star_mark(row.p_preferred)
+      chosen = {"portfolio": row.t_portfolio, "kp": row.t_kp, "bmp": row.t_bmp}[row.preferred]
+      window_cards.append(
+          "<article>"
+          f"<strong>[{int(row.t1)}, {int(row.t2)}]</strong>"
+          f"<b>{row.mean * cfg.return_scale:.3f}{mark}</b>"
+          f"<span>N={int(row.n)} · 首选 t={_stat_text(chosen)}</span>"
+          "</article>"
+      )
+  st.markdown(f'<div class="window-row">{"".join(window_cards)}</div>', unsafe_allow_html=True)
+
   from ashare_event.figures import save_group_bars, save_grouped_paths
   from ashare_event.inference import mean_t
-  from ashare_event.tables import stars as star_mark
   from ashare_event.config import window_suffix
-
-  window_cols = st.columns(len(result.tests))
-  for column, row in zip(window_cols, result.tests.itertuples(index=False), strict=True):
-      with column.container(border=True):
-          mark = star_mark(row.p_preferred)
-          chosen_t = {"portfolio": row.t_portfolio, "kp": row.t_kp, "bmp": row.t_bmp}[row.preferred]
-          st.markdown(f"**[{int(row.t1)}, {int(row.t2)}]**  {row.mean * cfg.return_scale:.3f}{mark}")
-          st.caption(f"N={int(row.n)} · 首选 t={chosen_t:.2f}")
 
   car_col = f"car_{window_suffix(*car_window)}"
   figure_dir = Path(result.outputs["figures"])
@@ -873,7 +973,7 @@ if run or st.session_state.get("study_result") is not None:
       f"平均 CAR 对每条公司-事件等权；同一公司同一天不能重复；窗口重叠默认都保留，回归按公司聚类。"
       f"行情按 {cfg.benchmark} 的交易日对齐，价格为{adjust_label}。"
   )
-  tab_fig, tab_table, tab_note, tab_file = st.tabs(["图", "窗口表", "机制备忘", "导出"])
+  tab_fig, tab_table, tab_reg, tab_note, tab_file = st.tabs(["图", "窗口表", "回归", "机制备忘", "导出"])
   with tab_fig:
       view = st.radio(
           "图表",
@@ -915,7 +1015,7 @@ if run or st.session_state.get("study_result") is not None:
       show["平均 CAR"] = (show["mean"] * cfg.return_scale).round(3)
       show["显著性"] = show["p_preferred"].map(star_mark)
       for column, label in [("t_cs", "横截面 t"), ("t_bmp", "BMP t"), ("t_kp", "KP t"), ("t_portfolio", "组合 t")]:
-          show[label] = show[column].round(2)
+          show[label] = show[column].map(_stat_text)
       show["窗口"] = show.apply(lambda row: f"[{int(row.t1)}, {int(row.t2)}]", axis=1)
       show["首选"] = show["preferred"].map({"bmp": "BMP", "kp": "KP", "portfolio": "组合"})
       st.dataframe(
@@ -923,6 +1023,13 @@ if run or st.session_state.get("study_result") is not None:
           hide_index=True,
           use_container_width=True,
       )
+  with tab_reg:
+      st.caption("系数已经换成百分点。括号里是标准误。星号按该系数自己的 p 值，没有做多重检验校正。这是相关，不是平均处理效应。")
+      preview = _regression_preview(result.models)
+      if preview.empty:
+          st.caption("这次没有回归表。数值变量至少要有不同取值，而且通过估计窗的事件不能太少。")
+      else:
+          st.dataframe(preview, hide_index=True, use_container_width=True)
   with tab_note:
       st.caption("估计前的读法，用来对照你添加的变量。显著系数不能反过来证明机制已经成立。")
       st.markdown(result.theory_md)
@@ -983,7 +1090,7 @@ else:
         st.caption("信号成本、规模、合法性缺口，或你自己起的数值变量。文本列只作标记。")
     with step_c.container(border=True):
         st.markdown("**3. 看结果**")
-        st.caption("运行后在图、窗口表、机制备忘和导出之间切换。平均 CAR 的 1 是 1 个百分点。")
+        st.caption("运行后在图、窗口表、回归、机制备忘和导出之间切换。平均 CAR 的 1 是 1 个百分点。")
 
 with st.expander("方法说明"):
     st.markdown(
@@ -1003,6 +1110,6 @@ with st.expander("方法说明"):
     )
 
 st.markdown(
-    '<p class="site-footer">Part of <a href="https://eugenefinance.tech">EF Lab · eugenefinance.tech</a> · V0.2 · 仅供学习与研究，不构成投资建议。行情来自 AKShare 或你上传的文件。</p>',
+    '<p class="site-footer">Part of <a href="https://eugenefinance.tech">EF Lab · eugenefinance.tech</a> · V0.3 · 仅供学习与研究，不构成投资建议。行情来自 AKShare 或你上传的文件。</p>',
     unsafe_allow_html=True,
 )
