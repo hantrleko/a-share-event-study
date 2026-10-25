@@ -1,6 +1,6 @@
 [project]
 name = "ashare-event-study"
-version = "0.4.0"
+version = "1.0.0"
 description = "Reusable A-share event-study pipeline: abnormal returns, CAR paths, placebo tests, and regression tables."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,8 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 market = ["akshare>=1.14"]
-app = ["streamlit>=1.32"]
-all = ["akshare>=1.14", "streamlit>=1.32"]
+app = ["streamlit>=1.32", "plotly>=5.20"]
+all = ["akshare>=1.14", "streamlit>=1.32", "plotly>=5.20"]
+dev = ["ruff>=0.6"]
 
 [project.scripts]
 ashare-event = "ashare_event.__main__:main"

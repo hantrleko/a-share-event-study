@@ -32,6 +32,10 @@
 #   - A non-trading announcement date should roll forward.
 #   - firm_id (not the event date) is the dependence cluster.
 #   - Missing a day inside the CAR window drops that CAR.
+#   - after_close, when present, maps a post-close announcement to the next trading day.
+#   - Price-limit flags are a board/name heuristic, not an exchange status file.
+#   - Stars are not multiplicity-adjusted. p BH adjusts only the preferred p-values in the window table.
+#   - Two-way cluster columns use firm and event date. They are still associations.
 # ============================================================
 
 project_name: a-share-event-study
@@ -39,7 +43,7 @@ seed: 20240101
 mode: demo   # demo | local | akshare
 language: zh # zh | en
 
-model: market  # market | market_adjusted
+model: market  # market | market_adjusted | industry | ff3
 benchmark: "000300"
 adjust: qfq
 
@@ -54,6 +58,8 @@ min_estimation_obs: 80
 require_complete_window: true
 
 cluster: firm_id
+two_way_cluster: true
+wild_draws: 199
 covariates: [signal_cost, size_log, legitimacy_gap]
 include_peer_count: false
 return_scale: 100

@@ -8,3 +8,4 @@ pyarrow>=14
 pyfixest>=0.20
 akshare>=1.14
 streamlit>=1.32
+plotly>=5.20

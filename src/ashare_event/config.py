@@ -6,7 +6,7 @@ that were also used to fit the market model.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import yaml
@@ -48,6 +48,8 @@ class StudyConfig:
     root: Path
     verbose: bool = False
     extra: dict = field(default_factory=dict)
+    two_way_cluster: bool = False
+    wild_draws: int = 0
 
     def resolve(self, rel: str) -> Path:
         path = Path(rel)
@@ -84,19 +86,17 @@ def validate_windows(cfg: StudyConfig) -> None:
                 "两者重叠时，事件日会进入市场模型，异常收益被压向 0。"
                 "请把估计窗的右端点放到所有事件窗和路径窗的左边。"
             )
-    if cfg.model not in {"market", "market_adjusted"}:
-        raise ConfigError("model 只能是 market 或 market_adjusted。")
+    if cfg.model not in {"market", "market_adjusted", "industry", "ff3"}:
+        raise ConfigError("model 只能是 market、market_adjusted、industry 或 ff3。")
     if cfg.mode not in {"demo", "local", "akshare"}:
         raise ConfigError("mode 只能是 demo、local 或 akshare。")
     if cfg.language not in {"zh", "en"}:
         raise ConfigError("language 只能是 zh 或 en。")
     low, high = cfg.placebo_offsets
-    if high < 0 and high >= cfg.estimation_window[1]:
-        # Negative shifts that land inside the estimation window are allowed
-        # as pseudo-event dates; the shock contamination check is separate.
-        pass
     if low > high:
         raise ConfigError("placebo_offsets 的左端不能大于右端。")
+    if cfg.wild_draws < 0:
+        raise ConfigError("wild_draws 不能为负。")
     for mode in cfg.placebo_modes:
         if mode not in {"in_time", "in_space"}:
             raise ConfigError(f"未知安慰剂类型：{mode}")
@@ -141,6 +141,8 @@ def load_config(path: str | Path, **overrides) -> StudyConfig:
         paths=dict(raw.get("paths", {})),
         root=root,
         extra={k: v for k, v in raw.items() if k not in _KNOWN},
+        two_way_cluster=bool(raw.get("two_way_cluster", False)),
+        wild_draws=int(raw.get("wild_draws", 0)),
     )
     for key, value in overrides.items():
         if not hasattr(cfg, key):
@@ -178,7 +180,26 @@ _KNOWN = {
     "prices_file",
     "market_file",
     "paths",
+    "two_way_cluster",
+    "wild_draws",
 }
+
+
+def clone_config(cfg: StudyConfig) -> StudyConfig:
+    """Copy a config so a run cannot append windows onto the caller's object."""
+    return replace(
+        cfg,
+        estimation_window=tuple(cfg.estimation_window),
+        event_windows=[tuple(item) for item in cfg.event_windows],
+        path_window=tuple(cfg.path_window),
+        regression_window=tuple(cfg.regression_window),
+        placebo_offsets=tuple(cfg.placebo_offsets),
+        placebo_modes=list(cfg.placebo_modes),
+        covariates=list(cfg.covariates),
+        figure_size=tuple(cfg.figure_size),
+        paths=dict(cfg.paths),
+        extra=dict(cfg.extra),
+    )
 
 
 def window_suffix(left: int, right: int) -> str:

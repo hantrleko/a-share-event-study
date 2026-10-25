@@ -219,6 +219,126 @@ def save_grouped_paths(frame: pd.DataFrame, destination: Path, *, size: tuple[fl
     _save(fig, destination)
 
 
+def _plotly():
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return None
+    return go
+
+
+def _plotly_layout(fig):
+    fig.update_layout(
+        template="plotly_white",
+        height=420,
+        margin={"l": 48, "r": 20, "t": 24, "b": 48},
+        font={"family": "Microsoft YaHei, Noto Sans SC, sans-serif", "size": 13},
+        legend={"orientation": "h", "y": 1.12},
+    )
+    return fig
+
+
+def plotly_car_path(path: pd.DataFrame, scale: float, r_bar: float):
+    go = _plotly()
+    if go is None or path is None or path.empty:
+        return None
+    order = path.sort_values("rel_day")
+    mean = order["mean"].to_numpy(dtype=float) * scale
+    se = order["se"].to_numpy(dtype=float) * scale
+    n_obs = int(order["n"].max()) if len(order) else 0
+    factor = kp_factor(r_bar, n_obs)
+    if np.isfinite(r_bar) and r_bar > 0.02 and factor < 1:
+        se = se / factor
+    band = 1.96 * se
+    x = order["rel_day"].to_numpy()
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=list(x) + list(x[::-1]),
+            y=list(mean + band) + list((mean - band)[::-1]),
+            fill="toself",
+            fillcolor="rgba(31,78,121,0.15)",
+            line={"width": 0},
+            hoverinfo="skip",
+            name="95% 区间",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=mean,
+            mode="lines",
+            name="平均 CAR",
+            line={"color": "#1f4e79", "width": 2},
+            customdata=order["n"],
+            hovertemplate="相对日 %{x}<br>平均 CAR %{y:.3f}<br>N %{customdata}<extra></extra>",
+        )
+    )
+    fig.add_vline(x=0, line_color="#9b3a3a", line_width=1)
+    fig.update_xaxes(title="相对事件日的交易日")
+    fig.update_yaxes(title="平均 CAR（百分点）")
+    return _plotly_layout(fig)
+
+
+def plotly_grouped_paths(frame: pd.DataFrame):
+    go = _plotly()
+    if go is None or frame is None or frame.empty:
+        return None
+    fig = go.Figure()
+    fig.add_vline(x=0, line_color="#9b3a3a", line_width=1)
+    for name, part in frame.groupby("group", sort=False):
+        order = part.sort_values("rel_day")
+        fig.add_trace(
+            go.Scatter(
+                x=order["rel_day"],
+                y=order["mean"],
+                mode="lines",
+                name=str(name),
+                hovertemplate="相对日 %{x}<br>" + str(name) + " %{y:.3f}<extra></extra>",
+            )
+        )
+    fig.update_xaxes(title="相对事件日的交易日")
+    fig.update_yaxes(title="平均 CAR（百分点）")
+    return _plotly_layout(fig)
+
+
+def plotly_group_bars(frame: pd.DataFrame):
+    go = _plotly()
+    if go is None or frame is None or frame.empty:
+        return None
+    ordered = frame.sort_values("mean")
+    fig = go.Figure(
+        go.Bar(
+            x=ordered["mean"],
+            y=ordered["label"],
+            orientation="h",
+            marker_color=["#1f4e79" if value >= 0 else "#9b3a3a" for value in ordered["mean"]],
+            customdata=np.column_stack([ordered["n"], ordered["se"]]),
+            hovertemplate="%{y}<br>平均 CAR %{x:.3f}<br>N %{customdata[0]}<extra></extra>",
+            error_x={"type": "data", "array": 1.96 * ordered["se"], "color": "#8aa0b8"},
+        )
+    )
+    fig.update_xaxes(title="平均 CAR（百分点）")
+    return _plotly_layout(fig)
+
+
+def plotly_placebo(result: dict, scale: float):
+    go = _plotly()
+    if go is None:
+        return None
+    nulls = np.asarray(result.get("nulls", []), dtype=float)
+    nulls = nulls[np.isfinite(nulls)] * scale
+    if nulls.size == 0:
+        return None
+    fig = go.Figure(go.Histogram(x=nulls, marker_color="#1f4e79", name="安慰剂"))
+    actual = result.get("actual", np.nan)
+    if np.isfinite(actual):
+        fig.add_vline(x=float(actual) * scale, line_color="#9b3a3a", line_width=2)
+    fig.update_xaxes(title="安慰剂平均 CAR（百分点）")
+    fig.update_yaxes(title="抽取次数")
+    return _plotly_layout(fig)
+
+
 def write_captions(path: Path, captions: dict[str, str]) -> None:
     lines = ["% Captions produced by the pipeline. Edit the paper, not these sentences, if a number changes.", ""]
     for key, caption in captions.items():

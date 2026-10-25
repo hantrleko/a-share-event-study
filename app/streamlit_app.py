@@ -7,10 +7,10 @@ and become columns in the same table.
 from __future__ import annotations
 
 import inspect
-import io
+import json
 import re
 import sys
-import zipfile
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,9 +20,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from ashare_event.config import ConfigError, load_config, validate_windows
-from ashare_event.labels import event_type_label
-from ashare_event.market import read_price_frame
+from ashare_event import __version__
+from ashare_event.audit import audit_grid
+from ashare_event.bundle import build_zip
+from ashare_event.config import ConfigError, clone_config, load_config, validate_windows
+from ashare_event.labels import coef_label, event_type_label
+from ashare_event.market import read_factor_frame, read_industry_frame, read_price_frame
 from ashare_event.pipeline import run_study
 from ashare_event.schema import (
     FIELD_LABELS,
@@ -52,6 +55,13 @@ FIELD_HELP = {
     "firm_name": "公司名称，方便辨认。名称里若还有「示例」，不会用它下载真实行情。",
 }
 NAME_OK = re.compile(r"^[A-Za-z\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff]{0,40}$")
+APP_VERSION = "V" + ".".join(__version__.split(".")[:2])
+MODEL_LABELS = {
+    "market": "市场模型",
+    "market_adjusted": "市场调整",
+    "industry": "行业基准",
+    "ff3": "三因子",
+}
 EXAMPLE_EVENTS = {
     "ai_policy": [
         {"code": "002230", "event_date": "2023-07-13", "event_type": "ai_policy", "industry": "软件", "firm_name": "科大讯飞（示例）"},
@@ -140,6 +150,13 @@ def _apply_style() -> None:
           font-weight: 650;
           letter-spacing: -0.02em;
           line-height: 1.25;
+        }
+        .brand .kicker {
+          margin: 0 0 0.15rem;
+          color: #5a6a7a;
+          font-size: 0.72rem;
+          letter-spacing: 0.16em;
+          font-weight: 600;
         }
         .brand .subtitle { margin: 0.35rem 0 0; color: #5a6a7a; font-size: 0.92rem; }
         .kpi-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.55rem; margin: 0.4rem 0 0.7rem; }
@@ -303,57 +320,40 @@ def _stretch(widget) -> dict:
 
 def _show_png(path: Path, caption: str) -> None:
     if not path.exists() or path.stat().st_size < 800:
-        st.info("这张图还在写入。再切换一次即可。")
+        st.info("这张图没有画出来。组内不足 2 家时不会画；若刚跑完，再切换一次即可。")
         return
     st.image(path.read_bytes(), caption=caption, **_stretch(st.image))
 
 
-def _result_zip(result, cfg, figure_dir: Path, table_dir: Path) -> bytes:
-    windows = ", ".join(f"[{int(row.t1)}, {int(row.t2)}]" for row in result.tests.itertuples(index=False))
-    firms = int(result.events["firm_id"].nunique()) if len(result.events) and "firm_id" in result.events.columns else 0
-    lines = [
-        "A股事件研究 · 本次运行说明",
-        "",
-        f"模式：{cfg.mode}",
-        f"收益模型：{cfg.model}",
-        f"基准：{cfg.benchmark}",
-        f"复权：{cfg.adjust or '不复权'}",
-        f"估计窗：[{cfg.estimation_window[0]}, {cfg.estimation_window[1]}]",
-        f"路径窗：[{cfg.path_window[0]}, {cfg.path_window[1]}]",
-        f"回归窗：[{cfg.regression_window[0]}, {cfg.regression_window[1]}]",
-        f"CAR 窗：{windows}",
-        f"随机种子：{cfg.seed}",
-        f"进入估计的事件数：{len(result.events)}",
-        f"公司数：{firms}",
-        "",
-        "市场模型异常收益是相对基准的统计偏离，不是平均处理效应。",
-        "平均 CAR 对每条公司-事件等权。同一公司同一天不能重复。",
-        "星号来自首选检验，没有做多重检验校正。",
-        "图内不写标题，说明在文件名和这张说明里。",
-    ]
-    if result.simulated:
-        lines.append("本次数值来自模拟样本，不能写入论文。")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("methods_note.txt", ("\n".join(lines) + "\n").encode("utf-8"))
-        archive.writestr("csv/car_windows.csv", result.tests.to_csv(index=False).encode("utf-8-sig"))
-        archive.writestr("csv/event_car.csv", result.events.to_csv(index=False).encode("utf-8-sig"))
-        if table_dir.exists():
-            for path in sorted(table_dir.glob("*.tex")):
-                text = path.read_text(encoding="utf-8").strip()
-                if text:
-                    archive.writestr(f"tex/{path.name}", text.encode("utf-8"))
-        if figure_dir.exists():
-            for path in sorted(figure_dir.glob("*.png")):
-                if path.stat().st_size >= 800:
-                    archive.writestr(f"png/{path.name}", path.read_bytes())
-    return buf.getvalue()
+def _copy_frame(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+    return None if frame is None else frame.copy()
 
 
-def _group_label(column: str, name) -> str:
-    if column == "event_type":
-        return event_type_label("zh", str(name))
-    return str(name)
+def _private_run_dir() -> Path:
+    return Path(tempfile.mkdtemp(prefix="ashare_run_"))
+
+
+def _show_chart(fig, png: Path, caption: str, key: str | None = None) -> None:
+    if fig is not None:
+        kwargs = _stretch(st.plotly_chart)
+        if key and "key" in inspect.signature(st.plotly_chart).parameters:
+            kwargs["key"] = key
+        st.plotly_chart(fig, **kwargs)
+        st.caption(caption)
+        return
+    _show_png(png, caption)
+
+
+def _remember_run(result, source: str, window, inputs: dict) -> None:
+    history = st.session_state.setdefault("run_history", [])
+    run_id = str((getattr(result, "manifest", None) or {}).get("run_id") or len(history) + 1)
+    label = (
+        f"{run_id} · {source} · {MODEL_LABELS.get(result.config.model, result.config.model)}"
+        f" · [{window[0]}, {window[1]}]"
+    )
+    history.insert(0, {"label": label, "result": result, "window": window, "source": source, "inputs": inputs})
+    del history[5:]
+    st.session_state.last_inputs = inputs
 
 
 def _has_example_name(frame: pd.DataFrame | None) -> bool:
@@ -542,6 +542,8 @@ def _show_guide() -> None:
                     "- **路径窗**：图的横轴。每个点是从路径起点一直加到当天的平均累计异常收益。",
                     "- **市场模型**：先在估计窗里拟合「个股收益 = 截距 + 斜率 × 指数收益」，事件窗里减不掉的部分就是异常收益。",
                     "- **市场调整**：不估计截距和斜率，直接用个股收益减指数收益。",
+                    "- **行业基准 / 三因子**：指数或因子文件由你上传。程序不下载申万行业，也不生成因子收益。交易日仍按宽基指数的日历对齐。",
+                    "- **盘后**：CSV 里可以加一列 after_close。写成「盘后」或 1 时，从公告日的下一个交易日起对齐。",
                     "- **前复权**：分红送股之后价格仍能前后比较，算收益率时用这个。",
                 ]
             )
@@ -552,11 +554,12 @@ def _show_guide() -> None:
                     "**输出**",
                     "",
                     "- **平均 CAR**：窗口内异常收益加总后，再对公司取平均。表上的 1 表示 1 个百分点。",
-                    "- **首选检验**：事件日分散时用 BMP；公司残差彼此相关时用 KP；一半以上事件落在同一天时用组合时间序列检验。星号来自这一列。",
-                    "- **横截面 t**：假设每家公司彼此独立。事件扎堆时它会把显著性说得过高，所以只作对照。",
-                    "- **回归系数**：变量高一点时，累计异常收益相差多少个百分点。这是相关关系。",
-                    "- **路径图**：竖线是事件日。阴影是平均累计异常收益的 95% 区间。",
-                    "- **安慰剂图**：柱是把事件日挪走之后的平均累计异常收益，竖线是真实日期的结果。",
+                    "- **首选检验**：事件日分散时用 BMP；公司残差彼此相关时用 KP；一半以上事件落在同一天时用组合时间序列检验。星号来自这一列，没有做多重检验校正。",
+                    "- **p BH**：只把窗口表里这几行的首选 p 值做 Benjamini–Hochberg 调整。它不改星号。",
+                    "- **横截面 t 和秩 t**：假设或厚尾上的对照。事件扎堆时横截面 t 会把显著性说得过高。",
+                    "- **回归系数**：变量高一点时，累计异常收益相差多少个百分点。这是相关关系。双向聚类和 wild bootstrap 的 p 也不是处理效应的 p 值。",
+                    "- **路径图**：竖线是事件日。阴影是平均累计异常收益的 95% 区间。交互图和 PNG 是同一次估计。",
+                    "- **安慰剂图**：伪事件日上会重新拟合估计窗。柱是那些伪日期的平均累计异常收益，竖线是真实日期。这不是对照组。",
                     "- **候选机制**：估计前的三条读法，用来设计变量。它不是已经证实的结论。",
                     "- **tex 文件**：给论文直接引入。演示样本和模拟试跑的数字不能写入论文。",
                 ]
@@ -623,15 +626,21 @@ with st.sidebar:
     else:
         st.caption("演示样本只用来看流程，数字不能写入论文。")
 
+    audit_report = pd.DataFrame(columns=["行号", "代码", "级别", "问题"])
+    audit_error_count = 0
     if source == "演示样本":
         event_ready = _demo_events(config_path)
     else:
+        audit_report = audit_grid(st.session_state.event_grid)
+        audit_error_count = int((audit_report["级别"] == "错误").sum()) if len(audit_report) else 0
         event_ready = None
         try:
             event_ready = _usable_events(st.session_state.event_grid)
         except (SchemaError, ValueError) as exc:
-            import_error = import_error or str(exc)
-            st.error(import_error)
+            if audit_error_count == 0:
+                import_error = import_error or str(exc)
+                st.error(import_error)
+    st.session_state.audit_report = audit_report
 
     st.header("样本")
     industries: list[str] | None = None
@@ -685,6 +694,8 @@ with st.sidebar:
     adjust = base.adjust
     prices_frame = None
     market_frame = None
+    industry_frame = None
+    factors_frame = None
     if price_mode == "akshare":
         benchmark = st.text_input(
             "基准指数",
@@ -699,7 +710,7 @@ with st.sidebar:
             help="前复权让分红送股前后的价格能比较，算收益率时用它。不复权会在除权日出现假的大跌。",
         )
         adjust = {"前复权": "qfq", "后复权": "hfq", "不复权": ""}[adjust_label]
-        st.caption("基准是这条市场指数，不是行业指数。行业差别看结果里的分组路径。若要用行业指数，把该指数的日期和收盘价当作本地基准上传。交易日按这条指数的日历对齐。非交易日的事件日向后顺延，最多 10 个日历日。默认前复权，避免除权日造出假的大跌。")
+        st.caption("交易日按这条宽基指数的日历对齐。行业基准和三因子另传文件，不会替换这条日历。非交易日的事件日向后顺延，最多 10 个日历日。默认前复权，避免除权日造出假的大跌。")
     elif price_mode == "local":
         price_file = st.file_uploader("个股行情 CSV（代码、日期、收盘）", type=["csv"], key="prices_csv")
         market_file = st.file_uploader("指数行情 CSV（日期、收盘）", type=["csv"], key="market_csv")
@@ -749,11 +760,27 @@ with st.sidebar:
     st.header("模型")
     model = st.radio(
         "收益模型",
-        ["market", "market_adjusted"],
-        format_func=lambda item: "市场模型" if item == "market" else "市场调整",
+        ["market", "market_adjusted", "industry", "ff3"],
+        format_func=lambda item: MODEL_LABELS[item],
         key="return_model",
-        help="市场模型为每家公司估计自己的截距和斜率。市场调整则假定斜率是 1、截距是 0。",
+        help="市场模型为每家公司估计自己的截距和斜率。市场调整则假定斜率是 1、截距是 0。行业基准和三因子使用你上传的文件。",
     )
+    if model == "industry":
+        industry_file = st.file_uploader("行业指数 CSV（行业、日期、收盘）", type=["csv"], key="industry_csv")
+        st.caption("同一行业每天一行收盘价。程序用它替换市场收益，仍用上面的宽基指数决定交易日。不会自动匹配申万行业。")
+        if industry_file is not None:
+            try:
+                industry_frame = read_industry_frame(pd.read_csv(industry_file))
+            except Exception as exc:
+                st.error(str(exc))
+    elif model == "ff3":
+        factor_file = st.file_uploader("三因子 CSV（日期、mkt、smb、hml）", type=["csv"], key="factor_csv")
+        st.caption("因子收益由你提供，程序不下载。日期要能对上宽基指数的交易日。")
+        if factor_file is not None:
+            try:
+                factors_frame = read_factor_frame(pd.read_csv(factor_file))
+            except Exception as exc:
+                st.error(str(exc))
     covariate_source = event_ready if event_ready is not None else st.session_state.event_grid
     covariate_options = _numeric_columns(covariate_source, st.session_state.custom_vars) if source == "我的事件表" else []
     if source == "演示样本" and event_ready is not None:
@@ -779,7 +806,7 @@ with st.sidebar:
         "做安慰剂",
         value=False,
         key="placebo",
-        help="把每家公司的事件日挪到估计窗之前的其他交易日，再重算平均 CAR。用来看真实日期是否突出。",
+        help="把事件日挪到估计窗之前的其他交易日，并在伪日期上重新拟合估计窗。用来看真实日期是否突出。这不是对照组。",
     )
     placebo_draws = int(
         st.number_input(
@@ -790,6 +817,17 @@ with st.sidebar:
             step=10,
             key="draws",
             help="挪动并重算的次数。次数越多，p 值越细，等待也越久。",
+        )
+    )
+    wild_draws = int(
+        st.number_input(
+            "wild bootstrap 次数",
+            min_value=0,
+            max_value=999,
+            value=0,
+            step=49,
+            key="wild",
+            help="只对不含固定效应的回归另算 wild cluster bootstrap p。0 表示不计算。命令行配置里是 199。次数多时网页会等很久。星号仍来自聚类标准误。",
         )
     )
 
@@ -813,10 +851,19 @@ with st.sidebar:
 
     missing = []
     example_blocked = source == "我的事件表" and _has_example_name(event_ready)
+    benchmark_blocked = source == "演示样本" and model in {"industry", "ff3"}
     if source == "我的事件表" and event_ready is None:
         missing.append("事件表")
     if example_blocked:
         missing.append("示例行")
+    if audit_error_count and not example_blocked:
+        missing.append("体检")
+    if benchmark_blocked:
+        missing.append("基准")
+    if model == "industry" and industry_frame is None:
+        missing.append("行业指数")
+    if model == "ff3" and factors_frame is None:
+        missing.append("三因子")
     if price_mode == "local" and (prices_frame is None or market_frame is None):
         missing.append("本地行情")
     if window_error or import_error:
@@ -826,8 +873,16 @@ with st.sidebar:
         block_reason = "还不能运行：至少填一行证券代码和事件日期。"
     elif example_blocked:
         block_reason = "还不能运行：公司名里还有「示例」。这是政策日示例，不是公司公告。核对后删掉这两个字。"
+    elif audit_error_count:
+        block_reason = f"数据体检有 {audit_error_count} 条错误。改正之后才能运行。警告和周末提示不会删行。"
+    elif benchmark_blocked:
+        block_reason = "演示样本只有市场基准。行业指数和三因子要换成自己的事件表，并上传对应文件。"
+    elif model == "industry" and industry_frame is None:
+        block_reason = "还不能运行：行业基准需要上传行业、日期、收盘。程序不会自动匹配申万指数。"
+    elif model == "ff3" and factors_frame is None:
+        block_reason = "还不能运行：三因子需要上传日期、mkt、smb、hml。程序不生成因子收益。"
     elif price_mode == "local" and (prices_frame is None or market_frame is None):
-        block_reason = "还不能运行：本地行情要同时上传个股和指数文件。"
+        block_reason = "还不能运行：本地行情要同时上传个股和指数文件。行业基准和三因子也仍要这条日历。"
     elif window_error or import_error:
         block_reason = window_error or import_error or "窗口或事件表还有问题。"
     run = st.button(
@@ -851,9 +906,9 @@ with logo_col:
     st.image(str(LOGO), width=112)
 with title_col:
     st.markdown(
-        """
+        f"""
 <div class="brand">
-  <p class="kicker">V0.4 · EUGENE FINANCE</p>
+  <p class="kicker">{APP_VERSION} · EUGENE FINANCE</p>
   <h1>EF Lab · A 股事件研究流水线</h1>
   <p class="subtitle">Interactive Event Study Pipeline for A-Shares · 仅供学习与研究，不构成投资建议</p>
 </div>
@@ -868,7 +923,7 @@ elif event_ready is None:
     st.badge("等待事件", color="gray")
 else:
     st.badge(
-        f"{ready_count} 个有效事件 · {'市场模型' if model == 'market' else '市场调整'} · CAR [{car_window[0]}, {car_window[1]}]",
+        f"{ready_count} 个有效事件 · {MODEL_LABELS.get(model, model)} · CAR [{car_window[0]}, {car_window[1]}]",
         color="green",
     )
 
@@ -877,7 +932,7 @@ with st.expander("先看懂", expanded=False):
         """
 <div class="lesson">
 <article><strong>异常收益是什么</strong><p>先用事件前的行情看这只股票平常怎样跟着指数走。事件窗口里，实际涨跌扣掉这个平常走势，剩下的就是异常收益。把窗口里的异常收益加起来，是累计异常收益，也就是 CAR。</p></article>
-<article><strong>为什么做安慰剂</strong><p>把事件日挪到别的交易日再算一遍平均 CAR。如果随便哪一天都能算出同样大的数，真实日期上的结果就没有那么特别。安慰剂不是对照组，也不能当成因果检验。</p></article>
+<article><strong>为什么做安慰剂</strong><p>把事件日挪到别的交易日，并在那一天重新拟合估计窗。如果随便哪一天都能算出同样大的数，真实日期上的结果就没有那么特别。百分位只说明位置。安慰剂不是对照组，也不能当成因果检验。</p></article>
 <article><strong>平均 CAR 怎么读</strong><p>表上的 1 是 1 个百分点。星号来自首选检验：* 是 10%，** 是 5%，*** 是 1%。事件如果扎在同一天，横截面 t 会把显著性说高，这时看组合检验。这是统计偏离，不是投资建议。</p></article>
 </div>
         """,
@@ -891,6 +946,16 @@ else:
     st.caption("固定列在左，你添加的变量在右。把鼠标放在列名上可看含义。空白行不会进入估计。")
 _show_guide()
 if source != "演示样本":
+    report = st.session_state.get("audit_report")
+    if isinstance(report, pd.DataFrame) and len(report):
+        n_err = int((report["级别"] == "错误").sum())
+        with st.expander("数据体检", expanded=n_err > 0):
+            st.dataframe(report, hide_index=True, **_stretch(st.dataframe))
+            if n_err:
+                st.caption(f"有 {n_err} 条错误。改正之后才能运行。警告和周末提示不会删行。")
+            else:
+                st.caption("没有必须改正的错误。警告请核对，周末会在运行时顺延。")
+if source != "演示样本":
     edited = st.data_editor(
         _align_grid(st.session_state.event_grid, st.session_state.custom_vars),
         num_rows="dynamic",
@@ -902,25 +967,77 @@ if source != "演示样本":
     )
     st.session_state.event_grid = edited
 
-if run or st.session_state.get("study_result") is not None:
-  if run:
-    cfg = load_config(config_path)
-    cfg.mode = price_mode
-    cfg.model = model
-    cfg.verbose = False
-    cfg.benchmark = benchmark
-    cfg.adjust = adjust
-    cfg.estimation_window = estimation
-    cfg.path_window = path_window
-    cfg.regression_window = car_window
-    cfg.event_windows = event_windows
-    cfg.covariates = list(covariates)
-    cfg.include_peer_count = include_peer
-    cfg.placebo_draws = placebo_draws
-    validate_windows(cfg)
-    sent_events = event_ready
-    if source != "演示样本" and drop_overlap and event_ready is not None:
-        sent_events = _drop_close_events(event_ready, car_window)
+pending = st.session_state.pop("pending_replay", None)
+if run or pending or st.session_state.get("study_result") is not None:
+  if run or pending:
+    if pending and not run:
+        snap = pending
+        cfg = clone_config(snap["cfg"])
+        run_source = snap["source"]
+        run_window = tuple(snap["car_window"])
+        run_kwargs = {
+            "industries": snap["industries"],
+            "event_types": snap["event_types"],
+            "regression_window": run_window,
+            "run_placebo": snap["run_placebo"],
+            "export": True,
+            "events_frame": snap["events_frame"],
+            "prices_frame": snap["prices_frame"],
+            "market_frame": snap["market_frame"],
+            "industry_frame": snap["industry_frame"],
+            "factors_frame": snap["factors_frame"],
+            "output_dir": _private_run_dir(),
+        }
+        inputs = snap
+    else:
+        cfg = load_config(config_path)
+        cfg.mode = price_mode
+        cfg.model = model
+        cfg.verbose = False
+        cfg.benchmark = benchmark
+        cfg.adjust = adjust
+        cfg.estimation_window = estimation
+        cfg.path_window = path_window
+        cfg.regression_window = car_window
+        cfg.event_windows = event_windows
+        cfg.covariates = list(covariates)
+        cfg.include_peer_count = include_peer
+        cfg.placebo_draws = placebo_draws
+        cfg.wild_draws = wild_draws
+        validate_windows(cfg)
+        sent_events = event_ready
+        if source != "演示样本" and drop_overlap and event_ready is not None:
+            sent_events = _drop_close_events(event_ready, car_window)
+        run_source = source
+        run_window = car_window
+        events_for_run = None if source == "演示样本" else sent_events
+        run_kwargs = {
+            "industries": industries,
+            "event_types": event_types,
+            "regression_window": car_window,
+            "run_placebo": do_placebo and placebo_draws > 0,
+            "export": True,
+            "events_frame": events_for_run,
+            "prices_frame": prices_frame,
+            "market_frame": market_frame,
+            "industry_frame": industry_frame,
+            "factors_frame": factors_frame,
+            "output_dir": _private_run_dir(),
+        }
+        inputs = {
+            "cfg": clone_config(cfg),
+            "source": source,
+            "car_window": car_window,
+            "industries": None if industries is None else list(industries),
+            "event_types": None if event_types is None else list(event_types),
+            "run_placebo": do_placebo and placebo_draws > 0,
+            "events_frame": _copy_frame(events_for_run),
+            "prices_frame": _copy_frame(prices_frame),
+            "market_frame": _copy_frame(market_frame),
+            "industry_frame": _copy_frame(industry_frame),
+            "factors_frame": _copy_frame(factors_frame),
+            "price_mode": price_mode,
+        }
     with st.status("正在计算累计异常收益…", expanded=True) as status:
         labels = {
             "inputs": "读取事件和行情",
@@ -934,26 +1051,16 @@ if run or st.session_state.get("study_result") is not None:
             status.update(label=labels.get(key, key))
 
         try:
-            result = run_study(
-                cfg,
-                industries=industries,
-                event_types=event_types,
-                regression_window=car_window,
-                run_placebo=do_placebo and placebo_draws > 0,
-                export=True,
-                events_frame=None if source == "演示样本" else sent_events,
-                prices_frame=prices_frame,
-                market_frame=market_frame,
-                on_step=_on_step,
-            )
+            result = run_study(cfg, on_step=_on_step, **run_kwargs)
         except Exception as exc:
             status.update(label="没有跑完", state="error")
             st.error(str(exc))
             st.stop()
         status.update(label="计算完成", state="complete", expanded=False)
         st.session_state.study_result = result
-        st.session_state.study_window = car_window
-        st.session_state.study_source = source
+        st.session_state.study_window = run_window
+        st.session_state.study_source = run_source
+        _remember_run(result, run_source, run_window, inputs)
   else:
     result = st.session_state.study_result
     cfg = result.config
@@ -1000,61 +1107,22 @@ if run or st.session_state.get("study_result") is not None:
       )
   st.markdown(f'<div class="window-row">{"".join(window_cards)}</div>', unsafe_allow_html=True)
 
-  from ashare_event.figures import save_group_bars, save_grouped_paths
-  from ashare_event.inference import mean_t
-  from ashare_event.config import window_suffix
+  from ashare_event.figures import plotly_car_path, plotly_group_bars, plotly_grouped_paths, plotly_placebo
+  from ashare_event.grouping import write_group_figures
 
-  car_col = f"car_{window_suffix(*car_window)}"
-  figure_dir = Path(result.outputs["figures"])
-
-  def _grouped(column: str) -> pd.DataFrame:
-      rows = []
-      if result.events.empty or car_col not in result.events.columns or column not in result.events.columns:
-          return pd.DataFrame(columns=["label", "mean", "se", "stars", "n"])
-      for name, part in result.events.groupby(column):
-          values = pd.to_numeric(part[car_col], errors="coerce").dropna().to_numpy(dtype=float)
-          if values.size < 2:
-              continue
-          mean, _t, p_value = mean_t(values)
-          se = float(values.std(ddof=1) / np.sqrt(values.size))
-          rows.append({"label": _group_label(column, name), "mean": mean * cfg.return_scale, "se": se * cfg.return_scale, "stars": star_mark(p_value), "n": int(values.size)})
-      return pd.DataFrame(rows)
-
-  industry_groups = _grouped("industry")
-  type_groups = _grouped("event_type")
-  if not industry_groups.empty:
-      save_group_bars(industry_groups, figure_dir / "fig_car_by_industry.png", size=tuple(cfg.figure_size))
-  if not type_groups.empty:
-      save_group_bars(type_groups, figure_dir / "fig_car_by_type.png", size=tuple(cfg.figure_size))
-
-  def _paths_for(column: str) -> pd.DataFrame:
-      if result.panel.empty or "car_path" not in result.panel.columns or column not in result.events.columns:
-          return pd.DataFrame(columns=["group", "rel_day", "mean", "se"])
-      counts = result.events[column].value_counts()
-      keep_names = set(counts.head(6).index)
-      meta = result.events.loc[result.events[column].isin(keep_names), ["event_id", column]]
-      merged = result.panel.dropna(subset=["car_path"]).merge(meta, on="event_id", how="inner")
-      rows = []
-      for (group, day), part in merged.groupby([column, "rel_day"]):
-          values = pd.to_numeric(part["car_path"], errors="coerce").dropna().to_numpy(dtype=float)
-          if values.size < 2:
-              continue
-          rows.append(
-              {
-                    "group": _group_label(column, group),
-                  "rel_day": int(day),
-                  "mean": float(values.mean()) * cfg.return_scale,
-                  "se": float(values.std(ddof=1) / np.sqrt(values.size)) * cfg.return_scale,
-              }
-          )
-      return pd.DataFrame(rows)
-
-  by_industry = _paths_for("industry")
-  by_type = _paths_for("event_type")
-  if by_industry["group"].nunique() > 1 if not by_industry.empty else False:
-      save_grouped_paths(by_industry, figure_dir / "fig_car_path_by_industry.png", size=tuple(cfg.figure_size))
-  if by_type["group"].nunique() > 1 if not by_type.empty else False:
-      save_grouped_paths(by_type, figure_dir / "fig_car_path_by_type.png", size=tuple(cfg.figure_size))
+  groups = getattr(result, "groups", None) or {}
+  figure_dir = Path(result.outputs["figures"]) if result.outputs.get("figures") else Path(".")
+  group_files = (
+      ("industry_bars", "fig_car_by_industry.png"),
+      ("type_bars", "fig_car_by_type.png"),
+      ("industry_paths", "fig_car_path_by_industry.png"),
+      ("type_paths", "fig_car_path_by_type.png"),
+  )
+  if result.outputs.get("figures") and any(
+      (frame := groups.get(key)) is not None and len(frame) and not (figure_dir / name).exists()
+      for key, name in group_files
+  ):
+      write_group_figures(groups, figure_dir, tuple(cfg.figure_size))
   multi_firms, close_pairs = _overlap_counts(result.events, car_window)
   adjust_label = {"qfq": "前复权", "hfq": "后复权", "": "不复权"}.get(cfg.adjust, cfg.adjust)
   st.caption(
@@ -1063,6 +1131,8 @@ if run or st.session_state.get("study_result") is not None:
       f"平均 CAR 对每条公司-事件等权；同一公司同一天不能重复；窗口重叠默认都保留，回归按公司聚类。"
       f"行情按 {cfg.benchmark} 的交易日对齐，价格为{adjust_label}。"
   )
+  if "limit_hit" in result.events.columns and bool(pd.Series(result.events["limit_hit"]).fillna(False).astype(bool).any()):
+      st.caption("有事件日的涨跌幅靠近涨跌停带宽。这是按板块和公司名做的启发式标记，不是交易所状态文件，程序没有因此删行。当天收益可能被涨跌停截断。")
   tab_fig, tab_table, tab_reg, tab_note, tab_file = st.tabs(["图", "窗口表", "回归", "机制备忘", "导出"])
   with tab_fig:
       view = st.radio(
@@ -1072,72 +1142,165 @@ if run or st.session_state.get("study_result") is not None:
           key="fig_view",
           help="路径按交易日累加。分组柱用的是侧栏里当前选中的 CAR 窗。",
       )
-      path_fig = figure_dir / "fig_car_path.png"
+      path_caption = "整体平均 CAR 路径。阴影是 95% 区间，竖线是事件日。交互图和下载的 PNG 来自同一次估计。"
       if view == "整体路径":
-          _show_png(path_fig, "整体平均 CAR 路径。阴影是 95% 区间，竖线是事件日。图内不写标题，说明在这行。")
+          _show_chart(
+              plotly_car_path(result.path, cfg.return_scale, float(getattr(result, "r_bar", 0) or 0)),
+              figure_dir / "fig_car_path.png",
+              path_caption,
+              key="plot-path",
+          )
       elif view == "分组路径":
           group_choice = st.radio("分组", ["行业", "事件类型"], horizontal=True, key="path_group")
-          group_path = figure_dir / ("fig_car_path_by_industry.png" if group_choice == "行业" else "fig_car_path_by_type.png")
-          _show_png(group_path, "每条线是一组的平均 CAR 路径，阴影是该组的 1.96 倍标准误。组内不足 2 家的不画。最多 6 组。事件类型用中文名。")
+          path_key = "industry_paths" if group_choice == "行业" else "type_paths"
+          png_name = "fig_car_path_by_industry.png" if group_choice == "行业" else "fig_car_path_by_type.png"
+          _show_chart(
+              plotly_grouped_paths(groups.get(path_key)),
+              figure_dir / png_name,
+              "每条线是一组的平均 CAR 路径。组内不足 2 家的不画。最多 6 组。星号不在这张路径上。",
+              key=f"plot-{path_key}",
+          )
       elif view == "分组柱":
-          industry_fig = figure_dir / "fig_car_by_industry.png"
-          type_fig = figure_dir / "fig_car_by_type.png"
           bar_left, bar_right = st.columns(2)
-          left_bytes = industry_fig.read_bytes() if industry_fig.exists() and industry_fig.stat().st_size >= 800 else None
-          right_bytes = type_fig.read_bytes() if type_fig.exists() and type_fig.stat().st_size >= 800 else None
-          if left_bytes:
-              bar_left.image(left_bytes, caption="按行业。误差线是 95% 区间，星号来自该组的横截面 t。", **_stretch(st.image))
-          if right_bytes:
-              bar_right.image(right_bytes, caption="按事件类型。星号：* 10%，** 5%，*** 1%。", **_stretch(st.image))
-          if left_bytes is None and right_bytes is None:
-              st.info("分组柱还在写入，或这一组不足 2 家公司。再切换一次即可。")
+          with bar_left:
+              _show_chart(
+                  plotly_group_bars(groups.get("industry_bars")),
+                  figure_dir / "fig_car_by_industry.png",
+                  "按行业。误差线是 95% 区间，星号来自该组的横截面 t，不是首选检验。",
+                  key="plot-ind-bars",
+              )
+          with bar_right:
+              _show_chart(
+                  plotly_group_bars(groups.get("type_bars")),
+                  figure_dir / "fig_car_by_type.png",
+                  "按事件类型。星号：* 10%，** 5%，*** 1%。这是横截面 t。",
+                  key="plot-type-bars",
+              )
       else:
           if not result.placebos:
-              st.caption("左侧勾选「做安慰剂」后，这里出现安慰剂分布。")
-          shown = False
-          for mode_name in result.placebos:
-              picture = figure_dir / f"fig_placebo_{mode_name}.png"
-              if picture.exists() and picture.stat().st_size >= 800:
-                  _show_png(picture, "安慰剂直方图。柱是挪走事件日后的平均 CAR，竖线是真实日期。")
-                  shown = True
-          if result.placebos and not shown:
-              st.info("安慰剂图还在写入。再切换一次即可。")
+              st.caption("左侧勾选「做安慰剂」后，这里出现安慰剂分布。伪日期上会重新拟合估计窗。")
+          else:
+              for mode_name, pack in result.placebos.items():
+                  title = "时间安慰剂" if mode_name == "in_time" else "截面安慰剂" if mode_name == "in_space" else mode_name
+                  st.markdown(f"**{title}**")
+                  _show_chart(
+                      plotly_placebo(pack, cfg.return_scale),
+                      figure_dir / f"fig_placebo_{mode_name}.png",
+                      pack.get("sentence") or "柱是伪日期的平均 CAR，竖线是真实日期。这不是对照组，也不是因果 p 值。",
+                      key=f"plot-placebo-{mode_name}",
+                  )
   with tab_table:
-      st.caption("每一行是一个累加窗口。平均 CAR 已换成百分点。显著性按首选检验标注。")
+      st.caption("每一行是一个累加窗口。平均 CAR 已换成百分点。星号来自未校正的首选 p 值。p BH 只在这几行之间做 Benjamini–Hochberg 调整，不改星号。秩 t 是厚尾对照，不是处理效应检验。")
       show = result.tests.copy()
       show["平均 CAR"] = (show["mean"] * cfg.return_scale).round(3)
       show["显著性"] = show["p_preferred"].map(star_mark)
       for column, label in [("t_cs", "横截面 t"), ("t_bmp", "BMP t"), ("t_kp", "KP t"), ("t_portfolio", "组合 t")]:
           show[label] = show[column].map(_stat_text)
+      if "t_corrado" in show.columns:
+          show["秩 t"] = show["t_corrado"].map(_stat_text)
+      if "p_bh" in show.columns:
+          show["p BH"] = show["p_bh"].map(lambda value: "—" if pd.isna(value) else f"{float(value):.3f}")
       show["窗口"] = show.apply(lambda row: f"[{int(row.t1)}, {int(row.t2)}]", axis=1)
       show["首选"] = show["preferred"].map({"bmp": "BMP", "kp": "KP", "portfolio": "组合"})
+      table_columns = ["窗口", "n", "平均 CAR", "显著性", "横截面 t", "BMP t", "KP t", "组合 t", "首选"]
+      for extra in ("秩 t", "p BH"):
+          if extra in show.columns:
+              table_columns.append(extra)
       st.dataframe(
-          show[["窗口", "n", "平均 CAR", "显著性", "横截面 t", "BMP t", "KP t", "组合 t", "首选"]].rename(columns={"n": "N"}),
+          show[table_columns].rename(columns={"n": "N"}),
           hide_index=True,
           **_stretch(st.dataframe),
       )
   with tab_reg:
-      st.caption("系数已经换成百分点。括号里是标准误。星号按该系数自己的 p 值，没有做多重检验校正。这是相关，不是平均处理效应。")
+      st.caption("系数已经换成百分点。括号里是聚类标准误。星号按该系数自己的 p 值，没有做多重检验校正。双向聚类列仍是相关关系。这不是平均处理效应。")
       preview = _regression_preview(result.models)
       if preview.empty:
           st.caption("这次没有回归表。数值变量至少要有不同取值，而且通过估计窗的事件不能太少。")
       else:
           st.dataframe(preview, hide_index=True, **_stretch(st.dataframe))
+      if getattr(result, "regression_notes", ""):
+          st.caption(result.regression_notes)
+      wild_rows = []
+      for fitted in result.models:
+          for term, p_value in (fitted.get("wild_p") or {}).items():
+              wild_rows.append(
+                  {
+                      "规格": fitted["title"],
+                      "变量": coef_label(cfg.language, str(term)),
+                      "wild p": "—" if pd.isna(p_value) else f"{float(p_value):.3f}",
+                  }
+              )
+      if wild_rows:
+          st.caption("wild cluster bootstrap p 不加星号。聚类数少于 12 时用六点权重，否则用 ±1。它不是处理效应的 p 值。")
+          st.dataframe(pd.DataFrame(wild_rows), hide_index=True, **_stretch(st.dataframe))
+      vif = getattr(result, "vif", None)
+      if vif is not None and len(vif):
+          st.caption("方差膨胀系数。大于 10 说明这些变量挤在一起，系数会不稳。它不是删变量的规则。")
+          st.dataframe(vif, hide_index=True, **_stretch(st.dataframe))
+      dictionary = getattr(result, "dictionary", None)
+      if dictionary is not None and len(dictionary):
+          st.caption("变量字典。均值和标准差按进入回归前的取值，不是百分点。")
+          st.dataframe(dictionary, hide_index=True, **_stretch(st.dataframe))
   with tab_note:
       st.caption("估计前的读法，用来对照你添加的变量。显著系数不能反过来证明机制已经成立。")
       st.markdown(result.theory_md)
   with tab_file:
-      st.caption("CAR 表、回归表和 PNG 都来自同一次运行。演示样本和模拟试跑不能写进正文。")
+      st.caption("CAR 表、回归表、PNG、方法段和 manifest 都来自同一次运行。网站每次写到单独的临时目录，不会改公共的 paper 目录。演示样本和模拟试跑不能写进正文。")
       st.download_button(
           "下载本次结果打包",
-          data=_result_zip(result, cfg, figure_dir, Path(result.outputs["tables"])),
+          data=build_zip(result),
           file_name="event_study.zip",
           mime="application/zip",
           type="primary",
-          help="里面有 tex、csv、png 和一份方法说明。",
+          help="里面有 tex、csv、png、方法段和 manifest。安慰剂抽取是小数收益率。",
           **_stretch(st.download_button),
           key="dl-zip",
       )
+      history = st.session_state.get("run_history") or []
+      if history:
+          picked = st.selectbox("本次会话里的运行", [item["label"] for item in history], key="history_pick")
+          if st.button("查看这次", key="history_view"):
+              chosen = next(item for item in history if item["label"] == picked)
+              st.session_state.study_result = chosen["result"]
+              st.session_state.study_window = chosen["window"]
+              st.session_state.study_source = chosen["source"]
+              st.rerun()
+      snapshot = next((item["inputs"] for item in history if item["result"] is result), None)
+      snapshot = snapshot or st.session_state.get("last_inputs")
+      if snapshot is None:
+          st.caption("这次会话里还没有可重跑的快照。")
+      elif snapshot.get("price_mode") == "local" and (
+          snapshot.get("prices_frame") is None or snapshot.get("market_frame") is None
+      ):
+          st.error("这份快照没有留下本地行情，无法重跑。")
+      elif st.button("按这份快照再跑一次", key="replay_run"):
+          st.session_state.pending_replay = snapshot
+          st.rerun()
+      if getattr(result, "methods_zh", ""):
+          st.text_area("中文方法段", result.methods_zh, height=180)
+      if getattr(result, "methods_en", ""):
+          st.text_area("English methods note", result.methods_en, height=160)
+      if getattr(result, "manifest", None):
+          manifest_text = json.dumps(result.manifest, ensure_ascii=False, indent=2)
+          st.download_button(
+              "下载 manifest.json",
+              data=manifest_text.encode("utf-8"),
+              file_name="manifest.json",
+              mime="application/json",
+              key="dl-manifest",
+          )
+      for mode_name, pack in (result.placebos or {}).items():
+          nulls = np.asarray(pack.get("nulls", []), dtype=float)
+          nulls = nulls[np.isfinite(nulls)]
+          if nulls.size:
+              st.download_button(
+                  f"下载安慰剂抽取 {mode_name}",
+                  data=pd.DataFrame({"null_mean_car": nulls}).to_csv(index=False).encode("utf-8-sig"),
+                  file_name=f"placebo_{mode_name}.csv",
+                  mime="text/csv",
+                  key=f"dl-placebo-{mode_name}",
+                  help="小数收益率，不是百分点。",
+              )
       file_cols = st.columns(2)
       saved = Path(result.outputs["tables"])
       names = ["table_car.tex", "table_summary.tex", "table_regression.tex", "table_placebo.tex"]
@@ -1198,7 +1361,9 @@ else:
 with st.expander("方法说明"):
     st.markdown(
         """
-**市场模型。** 在估计窗里，为每家公司单独拟合「个股收益 = 截距 + 斜率 × 市场基准收益」。事件窗里的实际收益减去这条拟合值，才是异常收益。市场调整则不估计截距和斜率，直接减市场基准收益。基准默认是沪深 300，可以改成别的指数代码；这不是行业指数。行业差别放在分组图里看。
+**市场模型。** 在估计窗里，为每家公司单独拟合「个股收益 = 截距 + 斜率 × 市场基准收益」。事件窗里的实际收益减去这条拟合值，才是异常收益。市场调整则不估计截距和斜率，直接减市场基准收益。基准默认是沪深 300。行业基准换成你上传的行业指数；三因子使用你上传的 mkt、smb、hml。程序不下载申万行业，也不生成因子。交易日仍按宽基指数对齐。
+
+**盘后。** 事件表可以加一列 after_close。写成「盘后」或 1 时，从记录日的下一个交易日起对齐，并且仍要落在 10 个日历日以内。不填就按记录日当天对齐。
 
 **估计窗。** 默认是事件日前第 250 个交易日到第 31 个交易日。它必须整段落在路径窗和所有 CAR 窗的左边。右端若碰到事件日，当天的大涨大跌会进入斜率，事件窗里的异常收益会被压向 0。那是前视，不是更干净的估计。
 
@@ -1208,11 +1373,15 @@ with st.expander("方法说明"):
 
 **交易与复权。** 交易日按基准指数的日历对齐，停牌日算缺失。事件窗里缺一天，这个窗口的 CAR 整段不要。AKShare 默认用前复权收盘价计算简单收益率。不复权会在除权日造出假的大跌。非交易日的事件日向后顺延，最多 10 个日历日。这叫非同步：公告日落在周末时，价格反应记在下一个交易日。
 
-**不要把星号读满。** 同时看 [-1, 1]、[-3, 3]、[-5, 5]，再按行业和事件类型切开，会提高「至少有一个显著」的机会。星号没有做多重检验校正。事件日扎在同一天时，横截面 t 会把显著性说高，这时看组合时间序列检验。回归系数是相关，不是平均处理效应。
+**安慰剂。** 时间安慰剂把事件日挪到估计窗之前，并在伪日期上重新拟合，不是把真实事件的异常收益平移。截面安慰剂在样本内重配价格序列后重新拟合。百分位只说明真实日期在这批伪日期里的位置。两侧都不是对照组，p 值也不是因果 p 值。
+
+**推断补充。** 星号来自未校正的首选 p 值。p BH 只调整窗口表里这些首选 p 值。秩 t 用来看厚尾，不是处理效应检验。回归可以另给公司和事件日的双向聚类标准误，以及不含固定效应规格上的 wild cluster bootstrap p。星号仍来自聚类标准误。涨跌停标记按板块和公司名推断带宽，不是交易所状态表，程序不因此删行。
+
+**不要把星号读满。** 同时看 [-1, 1]、[-3, 3]、[-5, 5]，再按行业和事件类型切开，会提高「至少有一个显著」的机会。事件日扎在同一天时，横截面 t 会把显著性说高，这时看组合时间序列检验。回归系数是相关，不是平均处理效应。
         """
     )
 
 st.markdown(
-    '<p class="site-footer">Part of <a href="https://eugenefinance.tech">EF Lab · eugenefinance.tech</a> · V0.4 · 仅供学习与研究，不构成投资建议。行情来自 AKShare 或你上传的文件。</p>',
+    f'<p class="site-footer">Part of <a href="https://eugenefinance.tech">EF Lab · eugenefinance.tech</a> · {APP_VERSION} · 仅供学习与研究，不构成投资建议。行情来自 AKShare 或你上传的文件。</p>',
     unsafe_allow_html=True,
 )

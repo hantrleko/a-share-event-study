@@ -1,0 +1,13 @@
+# Direct pins from the local environment on 2026-10-25.
+# Docker and CI install requirements.txt. This file records the versions those floors resolved to here.
+numpy==2.1.3
+pandas==2.2.3
+scipy==1.15.3
+statsmodels==0.14.6
+matplotlib==3.10.0
+PyYAML==6.0.2
+pyarrow==24.0.0
+pyfixest==0.60.0
+akshare==1.18.11
+streamlit==1.45.1
+plotly==5.24.1

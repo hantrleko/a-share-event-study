@@ -96,6 +96,8 @@ def car_table(tests: pd.DataFrame, language: str, scale: float, simulated: bool,
             text(language, "t_kp"),
             text(language, "t_port"),
             text(language, "preferred"),
+            "t 秩" if language == "zh" else "t rank",
+            "p BH",
         ]
     )
     rows = [header + r" \\"]
@@ -115,11 +117,13 @@ def car_table(tests: pd.DataFrame, language: str, scale: float, simulated: bool,
             _num(row.t_kp, 2),
             _num(row.t_portfolio, 2),
             pref.get(row.preferred, row.preferred),
+            _num(getattr(row, "t_corrado", np.nan), 2),
+            _num(getattr(row, "p_bh", np.nan), 3),
         ]
         rows.append(" & ".join(cells) + r" \\")
     tabular = "\n".join(
         [
-            "\\begin{tabular}{lrrrrrrl}",
+            "\\begin{tabular}{lrrrrrrlrr}",
             "\\toprule",
             rows[0],
             "\\midrule",
@@ -129,7 +133,17 @@ def car_table(tests: pd.DataFrame, language: str, scale: float, simulated: bool,
         ]
     )
     caption = "累计异常收益" if language == "zh" else "Cumulative abnormal returns"
-    return _wrap_table(caption, "tab:car", tabular, _notes(language, cluster, scale, simulated))
+    if language == "zh":
+        extra = [
+            "p BH 是对本表各窗口的首选 p 值做 Benjamini–Hochberg 调整。星号仍用未调整的首选 p 值。",
+            "t 秩把估计窗残差和事件窗异常收益放在一起排名，用来对照厚尾。它不是另一套处理效应检验。",
+        ]
+    else:
+        extra = [
+            "p BH adjusts the preferred p-values in this table by Benjamini-Hochberg. Stars still use the unadjusted preferred p-value.",
+            "The rank t pools estimation residuals and event-window abnormal returns. It is a thick-tail check, not a treatment-effect test.",
+        ]
+    return _wrap_table(caption, "tab:car", tabular, _notes(language, cluster, scale, simulated, extra))
 
 
 def summary_table(events: pd.DataFrame, outcome: str, covariates: list[str], language: str, scale: float, simulated: bool) -> str:
@@ -250,6 +264,18 @@ def regression_table(models: list[dict], language: str, scale: float, simulated:
     else:
         extra.append("Fixed-effect columns report within R². Columns without fixed effects report the ordinary R².")
         extra.append("Covariate coefficients are associations. The event study does not identify a causal effect.")
+    if any(model.get("two_way") for model in models):
+        extra.append(
+            "标成双向的列按公司和事件日聚类。"
+            if language == "zh"
+            else "Columns marked two-way are clustered by firm and event date."
+        )
+    if any(model.get("wild_p") for model in models):
+        extra.append(
+            "不含固定效应的规格另有 wild cluster bootstrap p，写在运行快照里。星号仍来自聚类标准误。"
+            if language == "zh"
+            else "Specifications without fixed effects also have wild cluster bootstrap p-values in the run manifest. Stars still use the clustered standard errors."
+        )
     return _wrap_table(caption, "tab:car_reg", tabular, _notes(language, cluster, scale, simulated, extra))
 
 
@@ -264,6 +290,7 @@ def placebo_table(placebos: dict, language: str, scale: float, simulated: bool) 
             "空值均值" if language == "zh" else "Null mean",
             "P5",
             "P95",
+            "百分位" if language == "zh" else "Percentile",
             "p",
         ]
     )
@@ -279,6 +306,7 @@ def placebo_table(placebos: dict, language: str, scale: float, simulated: bool) 
                     _num(result["null_mean"] * scale),
                     _num(result["p05"] * scale),
                     _num(result["p95"] * scale),
+                    _num(result.get("percentile", np.nan), 1),
                     _num(result["p_value"], 3),
                 ]
             )
@@ -286,7 +314,7 @@ def placebo_table(placebos: dict, language: str, scale: float, simulated: bool) 
         )
     tabular = "\n".join(
         [
-            "\\begin{tabular}{lrrrrrr}",
+            "\\begin{tabular}{lrrrrrrr}",
             "\\toprule",
             header + r" \\",
             "\\midrule",
@@ -301,12 +329,14 @@ def placebo_table(placebos: dict, language: str, scale: float, simulated: bool) 
             "时间安慰剂把每家公司的事件日移到估计窗之前的其他交易日。",
             "截面安慰剂在样本内重配价格序列，事件日不变。",
             "两边的 p 值都是双侧随机化 p，加一修正。它们不是处理效应的 p 值。",
+            "百分位是实际平均 CAR 在安慰剂抽取里的经验分布位置。时间安慰剂会把估计窗一起挪到伪事件日之前再重新拟合。",
         ]
     else:
         notes = [
             "The in-time placebo moves each firm to another pre-event trading day.",
             "The in-space placebo reassigns price series inside the sample and keeps the event dates.",
             "Both p-values are two-sided randomization p-values with an add-one correction. They are not ATT p-values.",
+            "The percentile is the empirical rank of the actual mean CAR among the placebo draws. In-time draws refit the estimation window at the pseudo-event.",
         ]
     if simulated:
         notes.insert(0, text(language, "simulated"))

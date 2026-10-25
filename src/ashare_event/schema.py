@@ -18,6 +18,21 @@ class SchemaError(ValueError):
     """The event list cannot be used as a firm-event sample."""
 
 
+def parse_after_close(value) -> bool:
+    """True when the announcement should be mapped to the next trading day."""
+    if type(value).__name__ in {"bool", "bool_"}:
+        return bool(value)
+    if value is None:
+        return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower()
+    return text in {"1", "true", "t", "y", "yes", "是", "盘后", "after", "after_close"}
+
+
 def normalize_code(value) -> str:
     text = str(value).strip()
     if re.fullmatch(r"\d+\.0+", text):
@@ -56,6 +71,8 @@ def load_events(frame: pd.DataFrame) -> pd.DataFrame:
     ]
     if df["event_id"].duplicated().any():
         raise SchemaError("event_id 冲突。firm_id 与 event_date 的组合必须唯一。")
+    if "after_close" in df.columns:
+        df["after_close"] = df["after_close"].map(parse_after_close)
     return df
 
 
@@ -79,12 +96,15 @@ FIELD_ALIASES = {
     "industry": ["industry", "行业", "申万行业", "所属行业"],
     "firm_id": ["firm_id", "公司代码", "firm"],
     "firm_name": ["firm_name", "公司名称", "证券简称", "简称", "名称"],
+    "after_close": ["after_close", "盘后", "公告时点", "after_hours"],
 }
 _COVARIATE_ALIASES = {
     "信号成本": "signal_cost",
     "合法性缺口": "legitimacy_gap",
     "对数规模": "size_log",
     "规模": "size_log",
+    "盘后": "after_close",
+    "公告时点": "after_close",
 }
 
 
