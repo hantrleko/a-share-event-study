@@ -76,4 +76,8 @@ def build_zip(result) -> bytes:
             for path in sorted(figure_dir.glob("*.png")):
                 if path.stat().st_size >= 800:
                     archive.writestr(f"png/{path.name}", path.read_bytes())
+        from ashare_event.replication import replication_files
+
+        for name, payload in replication_files(result).items():
+            archive.writestr(name, payload)
     return buf.getvalue()

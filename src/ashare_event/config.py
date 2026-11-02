@@ -50,6 +50,9 @@ class StudyConfig:
     extra: dict = field(default_factory=dict)
     two_way_cluster: bool = False
     wild_draws: int = 0
+    anticipation_window: tuple[int, int] | None = None
+    winsorize: float = 0.0
+    market_lags: int = 0
 
     def resolve(self, rel: str) -> Path:
         path = Path(rel)
@@ -65,6 +68,12 @@ def _pair(value, name: str) -> tuple[int, int]:
     if left > right:
         raise ConfigError(f"{name} 的起点晚于终点：{left} > {right}。")
     return left, right
+
+
+def _optional_pair(value, name: str) -> tuple[int, int] | None:
+    if value is None or value == "" or value == []:
+        return None
+    return _pair(value, name)
 
 
 def _windows(value) -> list[tuple[int, int]]:
@@ -86,8 +95,20 @@ def validate_windows(cfg: StudyConfig) -> None:
                 "两者重叠时，事件日会进入市场模型，异常收益被压向 0。"
                 "请把估计窗的右端点放到所有事件窗和路径窗的左边。"
             )
-    if cfg.model not in {"market", "market_adjusted", "industry", "ff3"}:
-        raise ConfigError("model 只能是 market、market_adjusted、industry 或 ff3。")
+    if cfg.model not in {"market", "market_adjusted", "industry", "ff3", "ff5", "carhart"}:
+        raise ConfigError("model 只能是 market、market_adjusted、industry、ff3、ff5 或 carhart。")
+    if cfg.anticipation_window is not None:
+        left, right = cfg.anticipation_window
+        if right >= 0:
+            raise ConfigError("预事件窗口必须落在事件日之前，用来看信息有没有提前反映。")
+        if left <= est_end:
+            raise ConfigError(
+                f"预事件窗口从 {left} 开始，估计窗结束于 {est_end}。两者重叠时，预事件检验会用到拟合市场模型的日子。"
+            )
+    if not 0 <= float(cfg.winsorize) < 0.2:
+        raise ConfigError("winsorize 为 0 表示不缩尾，否则必须小于 0.2。")
+    if int(cfg.market_lags) not in {0, 1}:
+        raise ConfigError("market_lags 只能是 0 或 1。1 表示估计窗里加入市场收益的前一日和后一日。")
     if cfg.mode not in {"demo", "local", "akshare"}:
         raise ConfigError("mode 只能是 demo、local 或 akshare。")
     if cfg.language not in {"zh", "en"}:
@@ -143,6 +164,9 @@ def load_config(path: str | Path, **overrides) -> StudyConfig:
         extra={k: v for k, v in raw.items() if k not in _KNOWN},
         two_way_cluster=bool(raw.get("two_way_cluster", False)),
         wild_draws=int(raw.get("wild_draws", 0)),
+        anticipation_window=_optional_pair(raw.get("anticipation_window", [-10, -6]), "anticipation_window"),
+        winsorize=float(raw.get("winsorize", 0) or 0),
+        market_lags=int(raw.get("market_lags", 0) or 0),
     )
     for key, value in overrides.items():
         if not hasattr(cfg, key):
@@ -182,6 +206,9 @@ _KNOWN = {
     "paths",
     "two_way_cluster",
     "wild_draws",
+    "anticipation_window",
+    "winsorize",
+    "market_lags",
 }
 
 
@@ -199,6 +226,7 @@ def clone_config(cfg: StudyConfig) -> StudyConfig:
         figure_size=tuple(cfg.figure_size),
         paths=dict(cfg.paths),
         extra=dict(cfg.extra),
+        anticipation_window=None if cfg.anticipation_window is None else tuple(cfg.anticipation_window),
     )
 
 

@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from ashare_event.config import StudyConfig
-from ashare_event.returns import _align, _returns_and_calendar, car_on_position
+from ashare_event.returns import FACTOR_COLUMNS, _align, _returns_and_calendar, car_on_position
 from ashare_event.schema import parse_after_close
 
 
@@ -33,7 +33,7 @@ class _Store:
     factors: np.ndarray | None
 
 
-def _store(prices, market, industry_frame, factors_frame) -> _Store:
+def _store(prices, market, industry_frame, factors_frame, factor_columns=None) -> _Store:
     by_code, mkt, calendar = _returns_and_calendar(prices, market)
     firm = {code: series.reindex(calendar).to_numpy(dtype=float) for code, series in by_code.items()}
     industry: dict[str, np.ndarray] = {}
@@ -49,7 +49,9 @@ def _store(prices, market, industry_frame, factors_frame) -> _Store:
         prepared = prepare_factors(factors_frame)
         if prepared is not None:
             aligned = prepared.set_index("date").reindex(calendar)
-            factors = aligned[["mkt", "smb", "hml"]].to_numpy(dtype=float)
+            columns = list(factor_columns or ("mkt", "smb", "hml"))
+            if all(column in aligned.columns for column in columns):
+                factors = aligned[columns].to_numpy(dtype=float)
     return _Store(calendar=calendar, mkt=mkt.reindex(calendar).to_numpy(dtype=float), firm=firm, industry=industry, factors=factors)
 
 
@@ -102,7 +104,7 @@ def _one(store: _Store, code: str, pos: int, industry: str, cfg: StudyConfig) ->
         if benchmark is None:
             return np.nan
         model = "market"
-    elif model == "ff3":
+    elif model in FACTOR_COLUMNS:
         factors = store.factors
         if factors is None:
             return np.nan
@@ -116,6 +118,7 @@ def _one(store: _Store, code: str, pos: int, industry: str, cfg: StudyConfig) ->
         cfg.min_estimation_obs,
         cfg.require_complete_window,
         factors,
+        market_lags=int(getattr(cfg, "market_lags", 0) or 0),
     )
 
 
@@ -128,7 +131,7 @@ def event_cars(
     factors_frame: pd.DataFrame | None = None,
 ) -> pd.Series:
     """Regression-window CAR for each event, using the same kernel as the placebos."""
-    store = _store(prices, market, industry_frame, factors_frame)
+    store = _store(prices, market, industry_frame, factors_frame, FACTOR_COLUMNS.get(cfg.model))
     positions = _positions_from_dates(events, store)
     codes = _codes(events)
     industries = _industries(events)
@@ -206,7 +209,7 @@ def _pack(mode: str, actual: float, draws: np.ndarray) -> dict:
 
 
 def in_time_placebo(events, prices, market, cfg, actual, rng, industry_frame=None, factors_frame=None, store=None) -> dict:
-    store = store or _store(prices, market, industry_frame, factors_frame)
+    store = store or _store(prices, market, industry_frame, factors_frame, FACTOR_COLUMNS.get(cfg.model))
     base = _positions_from_aligned(events, store)
     codes = _codes(events)
     industries = _industries(events)
@@ -229,7 +232,7 @@ def in_time_placebo(events, prices, market, cfg, actual, rng, industry_frame=Non
 
 
 def in_space_placebo(events, prices, market, cfg, actual, rng, industry_frame=None, factors_frame=None, store=None) -> dict:
-    store = store or _store(prices, market, industry_frame, factors_frame)
+    store = store or _store(prices, market, industry_frame, factors_frame, FACTOR_COLUMNS.get(cfg.model))
     base = _positions_from_aligned(events, store)
     codes = _codes(events)
     industries = _industries(events)
@@ -260,7 +263,7 @@ def run_placebos(
     industry_frame: pd.DataFrame | None = None,
     factors_frame: pd.DataFrame | None = None,
 ) -> dict[str, dict]:
-    store = _store(prices, market, industry_frame, factors_frame)
+    store = _store(prices, market, industry_frame, factors_frame, FACTOR_COLUMNS.get(cfg.model))
     results = {}
     if "in_time" in cfg.placebo_modes:
         results["in_time"] = in_time_placebo(

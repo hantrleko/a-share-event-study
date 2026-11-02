@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from ashare_event.returns import _fit_market_model, car_variance, factor_car_variance, fit_factor_model
+from ashare_event.returns import FACTOR_COLUMNS, _fit_market_model, car_variance, factor_car_variance, fit_factor_model
 
 RBAR_MAX_EVENTS = 80
 
@@ -90,8 +90,8 @@ def portfolio_t(
     if share < min_share:
         return np.nan, np.nan, share
     ids = set(events.loc[dates == modal, "event_id"])
-    if model == "ff3":
-        return _portfolio_factor_t(panel, ids, window, estimation_window, share)
+    if model in FACTOR_COLUMNS:
+        return _portfolio_factor_t(panel, ids, window, estimation_window, share, FACTOR_COLUMNS[model])
     sub = panel.loc[panel["event_id"].isin(ids), ["rel_day", "ret", "mkt_ret"]].dropna()
     if sub.empty:
         return np.nan, np.nan, share
@@ -113,22 +113,23 @@ def portfolio_t(
     return t_stat, _two_sided(t_stat, fit["df"]), share
 
 
-def _portfolio_factor_t(panel, ids, window, estimation_window, share) -> tuple[float, float, float]:
-    columns = ["rel_day", "ret", "fac_mkt", "fac_smb", "fac_hml"]
+def _portfolio_factor_t(panel, ids, window, estimation_window, share, names) -> tuple[float, float, float]:
+    fac_cols = [f"fac_{name}" for name in names]
+    columns = ["rel_day", "ret", *fac_cols]
     if any(column not in panel.columns for column in columns):
         return np.nan, np.nan, share
     sub = panel.loc[panel["event_id"].isin(ids), columns].dropna()
     if sub.empty:
         return np.nan, np.nan, share
-    portfolio = sub.groupby("rel_day", as_index=False)[["ret", "fac_mkt", "fac_smb", "fac_hml"]].mean()
+    portfolio = sub.groupby("rel_day", as_index=False)[["ret", *fac_cols]].mean()
     est_left, est_right = estimation_window
     est = portfolio[(portfolio["rel_day"] >= est_left) & (portfolio["rel_day"] <= est_right)]
-    fit = fit_factor_model(est["ret"].to_numpy(dtype=float), est[["fac_mkt", "fac_smb", "fac_hml"]].to_numpy(dtype=float))
+    fit = fit_factor_model(est["ret"].to_numpy(dtype=float), est[fac_cols].to_numpy(dtype=float))
     if fit is None:
         return np.nan, np.nan, share
     left, right = window
     event = portfolio[(portfolio["rel_day"] >= left) & (portfolio["rel_day"] <= right)]
-    x_event = event[["fac_mkt", "fac_smb", "fac_hml"]].to_numpy(dtype=float)
+    x_event = event[fac_cols].to_numpy(dtype=float)
     ar = event["ret"].to_numpy(dtype=float) - (fit["alpha"] + x_event @ fit["betas"])
     if not np.isfinite(ar).all() or ar.size == 0:
         return np.nan, np.nan, share
@@ -137,6 +138,50 @@ def _portfolio_factor_t(panel, ids, window, estimation_window, share) -> tuple[f
         return np.nan, np.nan, share
     t_stat = float(np.sum(ar) / np.sqrt(var_car))
     return t_stat, _two_sided(t_stat, fit["df"]), share
+
+
+def calendar_time_t(panel: pd.DataFrame, events: pd.DataFrame, window: tuple[int, int]) -> tuple[float, float]:
+    """t on the daily equal-weight mean abnormal return inside the window.
+
+    One calendar day leaves the t undefined. The portfolio t still covers that case.
+    """
+    if panel.empty or events.empty or "ar" not in panel.columns or "date" not in panel.columns:
+        return np.nan, np.nan
+    left, right = window
+    sub = panel.loc[panel["event_id"].isin(set(events["event_id"]))]
+    sub = sub[(sub["rel_day"] >= left) & (sub["rel_day"] <= right)]
+    daily = sub.groupby("date", sort=True)["ar"].mean().to_numpy(dtype=float)
+    daily = daily[np.isfinite(daily)]
+    if daily.size < 2:
+        return np.nan, np.nan
+    _mean, t_stat, p_value = mean_t(daily)
+    return t_stat, p_value
+
+
+def generalized_sign(events: pd.DataFrame, panel: pd.DataFrame, suffix: str) -> tuple[float, float]:
+    """Cowan-style sign test. The null proportion is the share of positive estimation residuals."""
+    car_col = f"car_{suffix}"
+    if events.empty or panel.empty or car_col not in events.columns or "resid" not in panel.columns:
+        return np.nan, np.nan
+    est = panel.loc[panel["in_est"], ["event_id", "resid"]].dropna()
+    if est.empty:
+        return np.nan, np.nan
+    shares = est.assign(positive=est["resid"] > 0).groupby("event_id")["positive"].agg(p_i="mean", n_obs="size")
+    shares = shares[shares["n_obs"] >= 10]
+    merged = events.set_index("event_id")[[car_col]].join(shares, how="inner")
+    merged = merged[np.isfinite(pd.to_numeric(merged[car_col], errors="coerce"))]
+    n_obs = int(len(merged))
+    if n_obs < 2:
+        return np.nan, np.nan
+    p_bar = float(merged["p_i"].mean())
+    if not np.isfinite(p_bar) or p_bar <= 0 or p_bar >= 1:
+        return np.nan, np.nan
+    wins = float((merged[car_col] > 0).sum())
+    denom = float(np.sqrt(n_obs * p_bar * (1.0 - p_bar)))
+    if denom <= 0:
+        return np.nan, np.nan
+    z_stat = float((wins - n_obs * p_bar) / denom)
+    return z_stat, float(2 * stats.norm.sf(abs(z_stat)))
 
 
 def corrado_t(panel: pd.DataFrame, events: pd.DataFrame, window: tuple[int, int]) -> tuple[float, float]:
@@ -230,6 +275,10 @@ def summarize_window(
     choice = preferred_name(t_port, r_bar)
     p_map = {"portfolio": p_port, "kp": p_kp, "bmp": p_bmp}
     t_rank, p_rank = corrado_t(panel, sample, window)
+    t_rank_kp = float(t_rank * factor) if np.isfinite(t_rank) else np.nan
+    t_calendar, p_calendar = calendar_time_t(panel, sample, window)
+    t_sign, p_sign = generalized_sign(sample, panel, suffix)
+    median = float(np.median(sample[car_col].to_numpy(dtype=float))) if n_obs else np.nan
     return {
         "t1": window[0],
         "t2": window[1],
@@ -250,4 +299,11 @@ def summarize_window(
         "p_preferred": p_map[choice],
         "t_corrado": t_rank,
         "p_corrado": p_rank,
+        "t_corrado_kp": t_rank_kp,
+        "p_corrado_kp": _two_sided(t_rank_kp, max(n_obs - 1, 1)),
+        "t_calendar": t_calendar,
+        "p_calendar": p_calendar,
+        "t_sign": t_sign,
+        "p_sign": p_sign,
+        "median": median,
     }

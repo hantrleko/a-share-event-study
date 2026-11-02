@@ -17,6 +17,14 @@ python -m ashare_event run --config config/study.yml
 
 命令行不传输出目录时，文件进 `paper/`、`output/` 和 `data/processed/`。网站每次运行使用单独的临时目录，避免同时使用的人互相覆盖。同一次运行还会写出 `manifest.json`、中英文方法段、VIF 和变量字典。
 
-`model` 可以是 `market`、`market_adjusted`、`industry` 或 `ff3`。后两个需要你自己的行业指数或三因子文件，程序不下载。事件表可选列 `after_close`：标成盘后时，从记录日的下一个交易日起对齐。安慰剂在伪日期上重新拟合估计窗。星号来自未校正的首选 p 值；p BH 只调整窗口表里的首选 p 值。
+`model` 可以是 `market`、`market_adjusted`、`industry`、`ff3`、`ff5` 或 `carhart`。行业指数和因子文件都要自己提供，程序不下载。五因子需要 `rmw`、`cma`，Carhart 需要 `umd`。事件表可选列 `after_close`：标成盘后时，从记录日的下一个交易日起对齐。安慰剂在伪日期上重新拟合估计窗。星号来自未校正的首选 p 值；p BH 只调整窗口表里的首选 p 值。
+
+对照规格不进主程序。需要时：
+
+```powershell
+python -m ashare_event robustness --demo
+```
+
+每次导出的 `logs/replication/` 里有 `study_repro.yml`、`events.csv`、`run_replication.py` 和 `replicate_regressions.do`。演示模式按种子重放。这份目录不含行情。`reghdfe` 需自行安装，`.do` 里的系数是相关，不是因果。
 
 原始行情只写一次。`ASHARE_RAW_DIR` 指向缓存目录；`ASHARE_EXTEND_CACHE=1` 时，盖不住的区间另写 `*.extended.parquet`，不覆盖原文件。

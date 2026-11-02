@@ -81,13 +81,14 @@ def read_events_csv(path) -> pd.DataFrame:
     return load_events(frame)
 
 
-STANDARD_FIELDS = ("code", "event_date", "event_type", "industry", "firm_name")
+STANDARD_FIELDS = ("code", "event_date", "event_type", "industry", "firm_name", "after_close")
 FIELD_LABELS = {
     "code": "证券代码",
     "event_date": "事件日期",
     "event_type": "事件类型",
     "industry": "行业",
     "firm_name": "公司名称",
+    "after_close": "盘后",
 }
 FIELD_ALIASES = {
     "code": ["code", "股票代码", "证券代码", "代码", "symbol"],

@@ -9,12 +9,15 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "app"))
+from style import APP_CSS
 
 import numpy as np
 import pandas as pd
@@ -27,11 +30,13 @@ from ashare_event.config import ConfigError, clone_config, load_config, validate
 from ashare_event.labels import coef_label, event_type_label
 from ashare_event.market import read_factor_frame, read_industry_frame, read_price_frame
 from ashare_event.pipeline import run_study
+from ashare_event.robustness import run_robustness
 from ashare_event.schema import (
     FIELD_LABELS,
     STANDARD_FIELDS,
     SchemaError,
     load_events,
+    parse_after_close,
     rename_to_standard,
 )
 from ashare_event.simulate import simulate
@@ -53,6 +58,7 @@ FIELD_HELP = {
     "event_type": "你给这件事起的标签，只用于筛选。行情软件里没有这个分类。",
     "industry": "你填的行业。用来筛选，也可以作为回归里的行业固定效应。",
     "firm_name": "公司名称，方便辨认。名称里若还有「示例」，不会用它下载真实行情。",
+    "after_close": "勾选表示盘后公告。对齐从公告日的下一个交易日开始。不勾选则用当天或顺延后的第一个交易日。",
 }
 NAME_OK = re.compile(r"^[A-Za-z\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff]{0,40}$")
 APP_VERSION = "V" + ".".join(__version__.split(".")[:2])
@@ -61,6 +67,8 @@ MODEL_LABELS = {
     "market_adjusted": "市场调整",
     "industry": "行业基准",
     "ff3": "三因子",
+    "ff5": "五因子",
+    "carhart": "Carhart",
 }
 EXAMPLE_EVENTS = {
     "ai_policy": [
@@ -87,141 +95,7 @@ LOGO = ROOT / "assets" / "eugene-finance-logo.jpg"
 
 
 def _apply_style() -> None:
-    st.markdown(
-        """
-        <style>
-        html, body, [class*="css"] { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
-        .stApp { background: #f4f7fb; color: #16324f; }
-        header[data-testid="stHeader"] { background: transparent; }
-        [data-testid="stToolbar"],
-        [data-testid="stDecoration"],
-        [data-testid="stAppDeployButton"],
-        .stAppDeployButton,
-        .stDeployButton,
-        #MainMenu { display: none !important; }
-        .block-container { padding-top: 0.45rem; padding-bottom: 2.2rem; max-width: 1180px; }
-        section[data-testid="stSidebar"] {
-          background: #eef3f8;
-          border-right: 1px solid #d5dee8;
-        }
-        section[data-testid="stSidebar"] > div { padding-top: 0.85rem; }
-        section[data-testid="stSidebar"] h2 {
-          font-size: 0.72rem;
-          letter-spacing: 0.16em;
-          color: #5a6a7a;
-          font-weight: 600;
-          margin-top: 0.4rem;
-          padding-top: 0.85rem;
-          border-top: 1px solid #d5dee8;
-        }
-        section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] p { font-size: 0.86rem; }
-        div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
-          background: #ffffff;
-          border-color: #d5dee8;
-        }
-        .stTabs [data-baseweb="tab-list"] { gap: 0.15rem; border-bottom: 1px solid #d5dee8; }
-        .stTabs [data-baseweb="tab"] { background: transparent; color: #5a6a7a; border-radius: 0; }
-        .stTabs [aria-selected="true"] { color: #1f4e79; border-bottom: 2px solid #1f4e79; }
-        div[data-testid="stAlert"] {
-          background: #f4f7fb;
-          border: 0;
-          border-left: 3px solid #1f4e79;
-          border-radius: 2px;
-          color: #16324f;
-        }
-        div[data-testid="stDataFrame"], div[data-testid="stDataEditor"] {
-          border: 1px solid #d5dee8;
-          border-radius: 2px;
-          background: #ffffff;
-        }
-        div[data-testid="stImage"] {
-          background: #ffffff;
-          border: 1px solid #d5dee8;
-          padding: 0.35rem;
-        }
-        .stButton > button[kind="primary"] {
-          background: #1f4e79;
-          border: 1px solid #1f4e79;
-        }
-        .brand h1 {
-          margin: 0;
-          color: #1f4e79;
-          font-size: 1.65rem;
-          font-weight: 650;
-          letter-spacing: -0.02em;
-          line-height: 1.25;
-        }
-        .brand .kicker {
-          margin: 0 0 0.15rem;
-          color: #5a6a7a;
-          font-size: 0.72rem;
-          letter-spacing: 0.16em;
-          font-weight: 600;
-        }
-        .brand .subtitle { margin: 0.35rem 0 0; color: #5a6a7a; font-size: 0.92rem; }
-        .kpi-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.55rem; margin: 0.4rem 0 0.7rem; }
-        .kpi {
-          background: #ffffff;
-          border: 1px solid #d5dee8;
-          border-radius: 8px;
-          padding: 0.62rem 0.75rem 0.55rem;
-          box-shadow: 0 1px 2px rgba(22, 50, 79, 0.05), 0 6px 16px rgba(22, 50, 79, 0.04);
-        }
-        .kpi span { display: block; font-size: 0.72rem; letter-spacing: 0.04em; color: #5a6a7a; }
-        .kpi strong {
-          display: block; margin-top: 0.18rem; font-size: 1.28rem; font-weight: 560;
-          font-variant-numeric: tabular-nums; color: #16324f;
-        }
-        .kpi.neg strong { color: #9b3a3a; }
-        .kpi.pos strong { color: #1d6b45; }
-        .site-footer {
-          margin-top: 1.6rem; padding-top: 0.75rem; border-top: 1px solid #d5dee8;
-          color: #5a6a7a; font-size: 0.82rem;
-        }
-        .lesson {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.7rem;
-  margin: 0.2rem 0 0.4rem;
-}
-.lesson article {
-  background: #ffffff;
-  border: 1px solid #d5dee8;
-  border-radius: 8px;
-  padding: 0.85rem 0.95rem 0.8rem;
-  box-shadow: 0 1px 2px rgba(22, 50, 79, 0.05);
-}
-.lesson strong { display: block; color: #1f4e79; margin-bottom: 0.35rem; font-size: 0.95rem; }
-        .lesson p { margin: 0; color: #3d4c5c; font-size: 0.92rem; line-height: 1.6; }
-        .window-row {
-          display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
-          gap: 0.55rem;
-          margin: 0.2rem 0 0.7rem;
-        }
-        .window-row article {
-          background: #ffffff;
-          border: 1px solid #d5dee8;
-          border-radius: 8px;
-          padding: 0.7rem 0.8rem 0.65rem;
-          box-shadow: 0 1px 2px rgba(22, 50, 79, 0.05);
-        }
-        .window-row strong { display: block; color: #5a6a7a; font-size: 0.78rem; font-weight: 600; }
-        .window-row b {
-          display: block; margin-top: 0.15rem; color: #16324f; font-size: 1.2rem; font-weight: 560;
-          font-variant-numeric: tabular-nums;
-        }
-        .window-row span { display: block; margin-top: 0.2rem; color: #5a6a7a; font-size: 0.78rem; }
-        @media (max-width: 900px) {
-          .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-          .brand h1 { font-size: 1.25rem; }
-          .lesson { grid-template-columns: 1fr; }
-          .window-row { grid-template-columns: 1fr; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(APP_CSS, unsafe_allow_html=True)
 
 
 _apply_style()
@@ -241,6 +115,7 @@ def _blank_grid(variables: list[dict], rows: int = 6) -> pd.DataFrame:
         "event_type": [""] * rows,
         "industry": [""] * rows,
         "firm_name": [""] * rows,
+        "after_close": [False] * rows,
     }
     for variable in variables:
         data[variable["name"]] = [np.nan if variable["kind"] == "number" else ""] * rows
@@ -255,9 +130,11 @@ def _align_grid(frame: pd.DataFrame, variables: list[dict]) -> pd.DataFrame:
         ("event_type", ""),
         ("industry", ""),
         ("firm_name", ""),
+        ("after_close", False),
     ):
         if field not in aligned.columns:
             aligned[field] = default
+    aligned["after_close"] = aligned["after_close"].map(parse_after_close)
     for variable in variables:
         if variable["name"] not in aligned.columns:
             aligned[variable["name"]] = np.nan if variable["kind"] == "number" else ""
@@ -344,7 +221,25 @@ def _show_chart(fig, png: Path, caption: str, key: str | None = None) -> None:
     _show_png(png, caption)
 
 
+def _release_panel(result) -> None:
+    panel = getattr(result, "panel", None)
+    if isinstance(panel, pd.DataFrame) and len(panel):
+        result.panel = panel.iloc[0:0].copy()
+
+
+def _discard_run_dir(item: dict) -> None:
+    result = item.get("result")
+    figures = (getattr(result, "outputs", None) or {}).get("figures")
+    if not figures:
+        return
+    root = Path(figures).parent
+    if "ashare_run_" not in root.name:
+        return
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def _remember_run(result, source: str, window, inputs: dict) -> None:
+    _release_panel(result)
     history = st.session_state.setdefault("run_history", [])
     run_id = str((getattr(result, "manifest", None) or {}).get("run_id") or len(history) + 1)
     label = (
@@ -352,7 +247,12 @@ def _remember_run(result, source: str, window, inputs: dict) -> None:
         f" · [{window[0]}, {window[1]}]"
     )
     history.insert(0, {"label": label, "result": result, "window": window, "source": source, "inputs": inputs})
-    del history[5:]
+    while len(history) > 5:
+        old = history.pop()
+        if old.get("result") is st.session_state.get("study_result"):
+            history.append(old)
+            break
+        _discard_run_dir(old)
     st.session_state.last_inputs = inputs
 
 
@@ -513,6 +413,12 @@ def _column_config(variables: list[dict]) -> dict:
         "event_type": st.column_config.TextColumn(FIELD_LABELS["event_type"], help=FIELD_HELP["event_type"], width="medium"),
         "industry": st.column_config.TextColumn(FIELD_LABELS["industry"], help=FIELD_HELP["industry"], width="medium"),
         "firm_name": st.column_config.TextColumn(FIELD_LABELS["firm_name"], help=FIELD_HELP["firm_name"], width="large"),
+        "after_close": st.column_config.CheckboxColumn(
+            FIELD_LABELS["after_close"],
+            help=FIELD_HELP["after_close"],
+            default=False,
+            width="small",
+        ),
     }
     for variable in variables:
         help_text = VARIABLE_HELP.get(
@@ -542,8 +448,8 @@ def _show_guide() -> None:
                     "- **路径窗**：图的横轴。每个点是从路径起点一直加到当天的平均累计异常收益。",
                     "- **市场模型**：先在估计窗里拟合「个股收益 = 截距 + 斜率 × 指数收益」，事件窗里减不掉的部分就是异常收益。",
                     "- **市场调整**：不估计截距和斜率，直接用个股收益减指数收益。",
-                    "- **行业基准 / 三因子**：指数或因子文件由你上传。程序不下载申万行业，也不生成因子收益。交易日仍按宽基指数的日历对齐。",
-                    "- **盘后**：CSV 里可以加一列 after_close。写成「盘后」或 1 时，从公告日的下一个交易日起对齐。",
+                    "- **行业基准 / 因子模型**：指数或因子文件由你上传。五因子需要 rmw 和 cma，Carhart 需要 umd。程序不下载申万行业，也不生成因子收益。交易日仍按宽基指数的日历对齐。",
+                    "- **盘后**：表里的勾选列。勾上后从公告日的下一个交易日起对齐。CSV 里写成「盘后」或 1 也行，它不会被当成回归变量。",
                     "- **前复权**：分红送股之后价格仍能前后比较，算收益率时用这个。",
                 ]
             )
@@ -556,7 +462,7 @@ def _show_guide() -> None:
                     "- **平均 CAR**：窗口内异常收益加总后，再对公司取平均。表上的 1 表示 1 个百分点。",
                     "- **首选检验**：事件日分散时用 BMP；公司残差彼此相关时用 KP；一半以上事件落在同一天时用组合时间序列检验。星号来自这一列，没有做多重检验校正。",
                     "- **p BH**：只把窗口表里这几行的首选 p 值做 Benjamini–Hochberg 调整。它不改星号。",
-                    "- **横截面 t 和秩 t**：假设或厚尾上的对照。事件扎堆时横截面 t 会把显著性说得过高。",
+                    "- **横截面 t 和秩 t**：假设或厚尾上的对照。事件扎堆时横截面 t 会把显著性说得过高。补充表里的日历 t、符号 z 和 BHAR 不改变首选检验。",
                     "- **回归系数**：变量高一点时，累计异常收益相差多少个百分点。这是相关关系。双向聚类和 wild bootstrap 的 p 也不是处理效应的 p 值。",
                     "- **路径图**：竖线是事件日。阴影是平均累计异常收益的 95% 区间。交互图和 PNG 是同一次估计。",
                     "- **安慰剂图**：伪事件日上会重新拟合估计窗。柱是那些伪日期的平均累计异常收益，竖线是真实日期。这不是对照组。",
@@ -578,7 +484,7 @@ with st.sidebar:
     source = st.radio("事件从哪来", ["演示样本", "我的事件表"], key="event_source")
     import_error = ""
     if source == "我的事件表":
-        st.caption("标准列：code, event_date, event_type, industry, firm_name。示例：`002230,2023-07-13,ai_policy,软件,科大讯飞`。")
+        st.caption("标准列：code, event_date, event_type, industry, firm_name, after_close。示例：`002230,2023-07-13,ai_policy,软件,科大讯飞`。盘后列勾选即可，不必写成回归变量。")
         if st.button("载入示例：人工智能管理办法 2023-07-13", key="ex_ai"):
             _load_named_example("ai_policy")
             st.rerun()
@@ -760,11 +666,16 @@ with st.sidebar:
     st.header("模型")
     model = st.radio(
         "收益模型",
-        ["market", "market_adjusted", "industry", "ff3"],
+        ["market", "market_adjusted", "industry", "ff3", "ff5", "carhart"],
         format_func=lambda item: MODEL_LABELS[item],
         key="return_model",
-        help="市场模型为每家公司估计自己的截距和斜率。市场调整则假定斜率是 1、截距是 0。行业基准和三因子使用你上传的文件。",
+        help="市场模型为每家公司估计自己的截距和斜率。市场调整则假定斜率是 1、截距是 0。行业基准和因子模型使用你上传的文件。",
     )
+    factor_needs = {
+        "ff3": ("mkt", "smb", "hml"),
+        "ff5": ("mkt", "smb", "hml", "rmw", "cma"),
+        "carhart": ("mkt", "smb", "hml", "umd"),
+    }
     if model == "industry":
         industry_file = st.file_uploader("行业指数 CSV（行业、日期、收盘）", type=["csv"], key="industry_csv")
         st.caption("同一行业每天一行收盘价。程序用它替换市场收益，仍用上面的宽基指数决定交易日。不会自动匹配申万行业。")
@@ -773,12 +684,20 @@ with st.sidebar:
                 industry_frame = read_industry_frame(pd.read_csv(industry_file))
             except Exception as exc:
                 st.error(str(exc))
-    elif model == "ff3":
-        factor_file = st.file_uploader("三因子 CSV（日期、mkt、smb、hml）", type=["csv"], key="factor_csv")
+    elif model in factor_needs:
+        factor_file = st.file_uploader(
+            "因子 CSV（日期、" + "、".join(factor_needs[model]) + "）",
+            type=["csv"],
+            key="factor_csv",
+        )
         st.caption("因子收益由你提供，程序不下载。日期要能对上宽基指数的交易日。")
         if factor_file is not None:
             try:
                 factors_frame = read_factor_frame(pd.read_csv(factor_file))
+                missing_factors = [name for name in factor_needs[model] if name not in factors_frame.columns]
+                if missing_factors:
+                    factors_frame = None
+                    st.error("因子文件还缺：" + "、".join(missing_factors))
             except Exception as exc:
                 st.error(str(exc))
     covariate_source = event_ready if event_ready is not None else st.session_state.event_grid
@@ -830,6 +749,24 @@ with st.sidebar:
             help="只对不含固定效应的回归另算 wild cluster bootstrap p。0 表示不计算。命令行配置里是 199。次数多时网页会等很久。星号仍来自聚类标准误。",
         )
     )
+    do_winsor = st.checkbox(
+        "横截面 CAR 上下 1% 缩尾",
+        value=False,
+        key="winsor",
+        help="默认关闭。打开后只缩 CAR 和 BHAR，不缩路径。至少 8 个事件才缩。安慰剂仍对照缩尾前的平均 CAR。",
+    )
+    do_lags = st.checkbox(
+        "估计窗加入市场前后一日",
+        value=False,
+        key="lags",
+        help="默认关闭。三个斜率相加。事件窗预测只用当天的市场收益。市场调整模型会忽略这项。",
+    )
+    do_anticipation = st.checkbox(
+        "报告预事件窗口 [-10, -6]",
+        value=True,
+        key="anticipation",
+        help="单独列出，不进入 BH，也不因此删事件。它必须落在估计窗右边、事件日之前。",
+    )
 
     window_error = None
     if estimation[0] > estimation[1] or path_window[0] > path_window[1] or car_window[0] > car_window[1]:
@@ -843,6 +780,9 @@ with st.sidebar:
         probe.path_window = path_window
         probe.regression_window = car_window
         probe.event_windows = event_windows
+        probe.winsorize = 0.01 if do_winsor else 0.0
+        probe.market_lags = 1 if do_lags else 0
+        probe.anticipation_window = (-10, -6) if do_anticipation else None
         try:
             validate_windows(probe)
         except ConfigError as exc:
@@ -851,7 +791,7 @@ with st.sidebar:
 
     missing = []
     example_blocked = source == "我的事件表" and _has_example_name(event_ready)
-    benchmark_blocked = source == "演示样本" and model in {"industry", "ff3"}
+    benchmark_blocked = source == "演示样本" and model in {"industry", "ff3", "ff5", "carhart"}
     if source == "我的事件表" and event_ready is None:
         missing.append("事件表")
     if example_blocked:
@@ -862,8 +802,8 @@ with st.sidebar:
         missing.append("基准")
     if model == "industry" and industry_frame is None:
         missing.append("行业指数")
-    if model == "ff3" and factors_frame is None:
-        missing.append("三因子")
+    if model in {"ff3", "ff5", "carhart"} and factors_frame is None:
+        missing.append("因子")
     if price_mode == "local" and (prices_frame is None or market_frame is None):
         missing.append("本地行情")
     if window_error or import_error:
@@ -876,13 +816,14 @@ with st.sidebar:
     elif audit_error_count:
         block_reason = f"数据体检有 {audit_error_count} 条错误。改正之后才能运行。警告和周末提示不会删行。"
     elif benchmark_blocked:
-        block_reason = "演示样本只有市场基准。行业指数和三因子要换成自己的事件表，并上传对应文件。"
+        block_reason = "演示样本只有市场基准。行业指数和因子模型要换成自己的事件表，并上传对应文件。"
     elif model == "industry" and industry_frame is None:
         block_reason = "还不能运行：行业基准需要上传行业、日期、收盘。程序不会自动匹配申万指数。"
-    elif model == "ff3" and factors_frame is None:
-        block_reason = "还不能运行：三因子需要上传日期、mkt、smb、hml。程序不生成因子收益。"
+    elif model in {"ff3", "ff5", "carhart"} and factors_frame is None:
+        needed = "、".join({"ff3": ("mkt", "smb", "hml"), "ff5": ("mkt", "smb", "hml", "rmw", "cma"), "carhart": ("mkt", "smb", "hml", "umd")}[model])
+        block_reason = f"还不能运行：因子文件需要日期、{needed}。程序不生成因子收益。"
     elif price_mode == "local" and (prices_frame is None or market_frame is None):
-        block_reason = "还不能运行：本地行情要同时上传个股和指数文件。行业基准和三因子也仍要这条日历。"
+        block_reason = "还不能运行：本地行情要同时上传个股和指数文件。行业基准和因子模型也仍要这条日历。"
     elif window_error or import_error:
         block_reason = window_error or import_error or "窗口或事件表还有问题。"
     run = st.button(
@@ -1004,6 +945,9 @@ if run or pending or st.session_state.get("study_result") is not None:
         cfg.include_peer_count = include_peer
         cfg.placebo_draws = placebo_draws
         cfg.wild_draws = wild_draws
+        cfg.winsorize = 0.01 if do_winsor else 0.0
+        cfg.market_lags = 1 if do_lags else 0
+        cfg.anticipation_window = (-10, -6) if do_anticipation else None
         validate_windows(cfg)
         sent_events = event_ready
         if source != "演示样本" and drop_overlap and event_ready is not None:
@@ -1211,6 +1155,45 @@ if run or pending or st.session_state.get("study_result") is not None:
           hide_index=True,
           **_stretch(st.dataframe),
       )
+      with st.expander("补充检验"):
+          from ashare_event.config import window_suffix
+
+          def _bhar_text(frame, left, right) -> str:
+              column = f"bhar_{window_suffix(int(left), int(right))}"
+              if column not in frame.columns:
+                  return "—"
+              values = pd.to_numeric(frame[column], errors="coerce")
+              if not values.notna().any():
+                  return "—"
+              return f"{float(values.mean()) * cfg.return_scale:.3f}"
+
+          extra_rows = []
+          for item in result.tests.itertuples(index=False):
+              extra_rows.append(
+                  {
+                      "窗口": f"[{int(item.t1)}, {int(item.t2)}]",
+                      "中位 CAR": _stat_text(item.median * cfg.return_scale) if np.isfinite(item.median) else "—",
+                      "平均 BHAR": _bhar_text(result.events, item.t1, item.t2),
+                      "日历 t": _stat_text(item.t_calendar),
+                      "符号 z": _stat_text(item.t_sign),
+                      "秩 t KP": _stat_text(item.t_corrado_kp),
+                  }
+              )
+          anticipated = getattr(result, "anticipation", None)
+          if anticipated:
+              extra_rows.append(
+                  {
+                      "窗口": f"预事件 [{int(anticipated['t1'])}, {int(anticipated['t2'])}]",
+                      "中位 CAR": _stat_text(float(anticipated["median"]) * cfg.return_scale),
+                      "平均 BHAR": _bhar_text(result.events, anticipated["t1"], anticipated["t2"]),
+                      "日历 t": _stat_text(anticipated["t_calendar"]),
+                      "符号 z": _stat_text(anticipated["t_sign"]),
+                      "秩 t KP": _stat_text(anticipated["t_corrado_kp"]),
+                  }
+              )
+          st.caption("这些列不改变首选检验，也不进入 p BH。BHAR 不替代 CAR。日历 t 在窗口只有一个交易日时没有定义。")
+          if extra_rows:
+              st.dataframe(pd.DataFrame(extra_rows), hide_index=True, **_stretch(st.dataframe))
   with tab_reg:
       st.caption("系数已经换成百分点。括号里是聚类标准误。星号按该系数自己的 p 值，没有做多重检验校正。双向聚类列仍是相关关系。这不是平均处理效应。")
       preview = _regression_preview(result.models)
@@ -1256,6 +1239,38 @@ if run or pending or st.session_state.get("study_result") is not None:
           **_stretch(st.download_button),
           key="dl-zip",
       )
+      if st.button(
+          "跑稳健性对照",
+          key="robust",
+          help="另估对照模型、1% 缩尾和较短估计窗。不做安慰剂，也不改上面的首选检验。",
+      ):
+          snap = next((item["inputs"] for item in (st.session_state.get("run_history") or []) if item["result"] is result), None)
+          if snap is None:
+              st.warning("这次运行没有留下输入快照。再点一次「运行并导出」后才能做对照。")
+          else:
+              with st.spinner("正在重估几组对照。"):
+                  robust = run_robustness(
+                      result.config,
+                      industries=snap.get("industries"),
+                      event_types=snap.get("event_types"),
+                      events_frame=snap.get("events_frame"),
+                      prices_frame=snap.get("prices_frame"),
+                      market_frame=snap.get("market_frame"),
+                      industry_frame=snap.get("industry_frame"),
+                      factors_frame=snap.get("factors_frame"),
+                  )
+              result.robustness = robust
+      robust_table = getattr(result, "robustness", None)
+      if isinstance(robust_table, pd.DataFrame) and len(robust_table):
+          shown = robust_table.copy()
+          shown["平均 CAR"] = pd.to_numeric(shown["mean_car"], errors="coerce") * cfg.return_scale
+          shown["平均 BHAR"] = pd.to_numeric(shown["mean_bhar"], errors="coerce") * cfg.return_scale
+          st.caption("对照表。平均 CAR 和 BHAR 已换成百分点。它不替换主表的首选检验。模拟样本的数字不能写入论文。")
+          st.dataframe(
+              shown[["label", "model", "estimation", "winsor", "n", "平均 CAR", "preferred", "t_preferred", "平均 BHAR", "note"]],
+              hide_index=True,
+              **_stretch(st.dataframe),
+          )
       history = st.session_state.get("run_history") or []
       if history:
           picked = st.selectbox("本次会话里的运行", [item["label"] for item in history], key="history_pick")

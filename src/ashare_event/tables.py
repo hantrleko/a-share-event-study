@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ashare_event.config import window_label
+from ashare_event.config import window_label, window_suffix
 from ashare_event.labels import coef_label, text
 
 
@@ -342,6 +342,97 @@ def placebo_table(placebos: dict, language: str, scale: float, simulated: bool) 
         notes.insert(0, text(language, "simulated"))
     notes.append(text(language, "scale_note", scale=scale))
     return _wrap_table(caption, "tab:placebo", tabular, notes)
+
+
+def _mean_column(events: pd.DataFrame, prefix: str, left: int, right: int, scale: float) -> float:
+    column = f"{prefix}{window_suffix(int(left), int(right))}"
+    if column not in events.columns:
+        return np.nan
+    values = pd.to_numeric(events[column], errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.nan
+    return float(values.mean() * scale)
+
+
+def diagnostics_table(
+    tests: pd.DataFrame,
+    events: pd.DataFrame,
+    anticipation: dict | None,
+    language: str,
+    scale: float,
+    simulated: bool,
+) -> str:
+    """Supplementary statistics. They do not change the preferred test or BH."""
+    header = " & ".join(
+        [
+            "窗口" if language == "zh" else "Window",
+            "N",
+            "中位 CAR" if language == "zh" else "Median CAR",
+            "平均 BHAR" if language == "zh" else "Mean BHAR",
+            "日历 t" if language == "zh" else "Calendar t",
+            "符号 z" if language == "zh" else "Sign z",
+            "秩 t KP" if language == "zh" else "Rank t KP",
+        ]
+    )
+    body = [header + r" \\"]
+
+    def _row(label: str, left: int, right: int, source: dict | pd.Series) -> str:
+        median = float(source["median"]) * scale if np.isfinite(source.get("median", np.nan)) else np.nan
+        cells = [
+            label,
+            str(int(source["n"])) if np.isfinite(source.get("n", np.nan)) else "0",
+            _num(median),
+            _num(_mean_column(events, "bhar_", left, right, scale)),
+            _num(source.get("t_calendar", np.nan), 2),
+            _num(source.get("t_sign", np.nan), 2),
+            _num(source.get("t_corrado_kp", np.nan), 2),
+        ]
+        return " & ".join(cells) + r" \\"
+
+    for row in tests.itertuples(index=False):
+        payload = row._asdict()
+        body.append(_row(window_label(int(row.t1), int(row.t2)), int(row.t1), int(row.t2), payload))
+    if anticipation:
+        tag = "预事件 " if language == "zh" else "Pre-event "
+        body.append(
+            _row(
+                tag + window_label(int(anticipation["t1"]), int(anticipation["t2"])),
+                int(anticipation["t1"]),
+                int(anticipation["t2"]),
+                anticipation,
+            )
+        )
+    tabular = "\n".join(
+        [
+            "\\begin{tabular}{lrrrrrr}",
+            "\\toprule",
+            body[0],
+            "\\midrule",
+            *body[1:],
+            "\\bottomrule",
+            "\\end{tabular}",
+        ]
+    )
+    if language == "zh":
+        notes = [
+            "这些列是补充，不改变首选检验，也不进入 p BH。星号仍在累计异常收益表上。",
+            "BHAR 是窗口内买进持有收益与预测收益之差，不替代 CAR。只有一天时两者相同。",
+            "日历 t 是窗口内按交易日等权平均异常收益的时间序列 t。窗口只覆盖一个交易日时它没有定义。",
+            "符号 z 用估计窗里正残差的比例做原假设。秩 t KP 是把秩 t 乘上 KP 因子，只作对照。",
+        ]
+        caption = "补充检验"
+    else:
+        notes = [
+            "These columns are supplements. They do not change the preferred test or the BH adjustment.",
+            "BHAR is the buy-and-hold gap versus the predicted path. It does not replace CAR. On one day the two are equal.",
+            "Calendar t is a t-test of the daily equal-weight abnormal return. It is undefined when the window covers one calendar day.",
+            "The sign z uses the share of positive estimation residuals. The KP rank t multiplies the rank t by the KP factor.",
+        ]
+        caption = "Supplementary tests"
+    if simulated:
+        notes.insert(0, text(language, "simulated"))
+    return _wrap_table(caption, "tab:diagnostics", tabular, notes)
 
 
 def write_text(path: Path, content: str) -> None:

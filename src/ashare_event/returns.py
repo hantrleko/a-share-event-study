@@ -15,6 +15,13 @@ import pandas as pd
 from ashare_event.config import window_suffix
 from ashare_event.schema import parse_after_close
 
+FACTOR_COLUMNS = {
+    "ff3": ("mkt", "smb", "hml"),
+    "ff5": ("mkt", "smb", "hml", "rmw", "cma"),
+    "carhart": ("mkt", "smb", "hml", "umd"),
+}
+_MODELS = {"market", "market_adjusted", "industry", *FACTOR_COLUMNS}
+
 
 @dataclass
 class Estimation:
@@ -57,6 +64,46 @@ def _fit_market_model(y: np.ndarray, x: np.ndarray, model: str) -> dict | None:
         "sxx": float(np.sum((x - x_bar) ** 2)),
         "n_est": n_obs,
         "df": n_obs - 2,
+        "kind": "market",
+    }
+
+
+def _fit_dimson(y: np.ndarray, x: np.ndarray) -> dict | None:
+    """Market model with one lead and one lag. Beta is the sum of the three slopes.
+
+    The event-window forecast is intercept plus that sum times the same-day
+    market return. Leads are not used after the estimation window.
+    Variance stays the single-index formula, with this regression's sigma2
+    and the contemporaneous market sum of squares.
+    """
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    if y.size < 5 or x.size != y.size:
+        return None
+    response = y[1:-1]
+    design_x = np.column_stack([x[:-2], x[1:-1], x[2:]])
+    mask = np.isfinite(response) & np.isfinite(design_x).all(axis=1)
+    response = response[mask]
+    design_x = design_x[mask]
+    n_obs = int(response.size)
+    if n_obs < 8:
+        return None
+    design = np.column_stack([np.ones(n_obs), design_x])
+    coef, _, _, _ = np.linalg.lstsq(design, response, rcond=None)
+    resid = response - design @ coef
+    df = n_obs - 4
+    if df <= 0:
+        return None
+    current = design_x[:, 1]
+    x_bar = float(np.mean(current))
+    return {
+        "alpha": float(coef[0]),
+        "beta": float(coef[1] + coef[2] + coef[3]),
+        "sigma2": float(np.sum(resid**2) / df),
+        "x_bar": x_bar,
+        "sxx": float(np.sum((current - x_bar) ** 2)),
+        "n_est": n_obs,
+        "df": df,
         "kind": "market",
     }
 
@@ -176,6 +223,7 @@ def car_on_position(
     min_estimation_obs: int,
     require_complete_window: bool,
     factors: np.ndarray | None = None,
+    market_lags: int = 0,
 ) -> float:
     """CAR at one calendar index. The estimation window moves with ``pos``."""
     n_obs = int(firm_ret.shape[0])
@@ -183,20 +231,24 @@ def car_on_position(
     if pos < 0 or pos + est_left < 0 or pos + est_right >= n_obs:
         return np.nan
     y = firm_ret[pos + est_left : pos + est_right + 1]
-    if model == "ff3":
+    if model in FACTOR_COLUMNS:
         if factors is None:
             return np.nan
         fit = fit_factor_model(y, factors[pos + est_left : pos + est_right + 1])
     else:
         kind = "market_adjusted" if model == "market_adjusted" else "market"
-        fit = _fit_market_model(y, benchmark[pos + est_left : pos + est_right + 1], kind)
+        benchmark_est = benchmark[pos + est_left : pos + est_right + 1]
+        if market_lags and kind == "market":
+            fit = _fit_dimson(y, benchmark_est)
+        else:
+            fit = _fit_market_model(y, benchmark_est, kind)
     if fit is None or fit["n_est"] < min_estimation_obs:
         return np.nan
     left, right = event_window
     if pos + left < 0 or pos + right >= n_obs:
         return np.nan
     y_event = firm_ret[pos + left : pos + right + 1]
-    if model == "ff3":
+    if model in FACTOR_COLUMNS:
         x_event = factors[pos + left : pos + right + 1]
         predicted = fit["alpha"] + x_event @ fit["betas"]
         finite = np.isfinite(y_event) & np.isfinite(x_event).all(axis=1)
@@ -242,25 +294,33 @@ def estimate_events(
     require_complete_window: bool = True,
     industry_frame: pd.DataFrame | None = None,
     factors_frame: pd.DataFrame | None = None,
+    market_lags: int = 0,
 ) -> Estimation:
-    if model not in {"market", "market_adjusted", "industry", "ff3"}:
-        raise ValueError("model 只能是 market、market_adjusted、industry 或 ff3。")
+    if model not in _MODELS:
+        raise ValueError("model 只能是 market、market_adjusted、industry、ff3、ff5 或 carhart。")
     by_code, mkt, calendar = _returns_and_calendar(prices, market)
     industry_map: dict[str, pd.Series] = {}
     factor_indexed = None
+    factor_names: tuple[str, ...] = ()
     if model == "industry":
         from ashare_event.market import prepare_industry_returns
 
         industry_map = prepare_industry_returns(industry_frame)
         if not industry_map:
             raise ValueError("行业基准需要行业指数行情，列至少包括行业、日期、收盘。程序不会自动匹配申万指数。")
-    if model == "ff3":
+    if model in FACTOR_COLUMNS:
         from ashare_event.market import prepare_factors
 
+        factor_names = FACTOR_COLUMNS[model]
         factors = prepare_factors(factors_frame)
-        if factors is None:
+        missing = [] if factors is None else [name for name in factor_names if name not in factors.columns]
+        if factors is None or missing:
+            if model == "ff5":
+                raise ValueError("五因子模型需要日期、mkt、smb、hml、rmw、cma。程序不生成因子收益。")
+            if model == "carhart":
+                raise ValueError("Carhart 模型需要日期、mkt、smb、hml、umd。程序不生成因子收益。")
             raise ValueError("三因子模型需要日期、mkt、smb、hml。程序不生成因子收益。")
-        factor_indexed = factors.set_index("date")[["mkt", "smb", "hml"]]
+        factor_indexed = factors.set_index("date")[list(factor_names)]
     est_left, est_right = estimation_window
     windows = list(dict.fromkeys([*event_windows, tuple(regression_window)]))
     slice_left = min(est_left, path_window[0], min(window[0] for window in windows))
@@ -304,34 +364,36 @@ def estimate_events(
                 dropped_rows.append({"event_id": event.event_id, "reason": "no_industry_benchmark"})
                 continue
             window_frame["mkt_ret"] = series.reindex(window_frame["date"]).to_numpy(dtype=float)
-        if model == "ff3":
+        fac_cols = [f"fac_{name}" for name in factor_names]
+        if factor_names:
             fac = factor_indexed.reindex(window_frame["date"])
-            window_frame["fac_mkt"] = fac["mkt"].to_numpy(dtype=float)
-            window_frame["fac_smb"] = fac["smb"].to_numpy(dtype=float)
-            window_frame["fac_hml"] = fac["hml"].to_numpy(dtype=float)
+            for name in factor_names:
+                window_frame[f"fac_{name}"] = fac[name].to_numpy(dtype=float)
             window_frame["mkt_ret"] = window_frame["fac_mkt"]
         est_mask = (window_frame["rel_day"] >= est_left) & (window_frame["rel_day"] <= est_right)
-        if model == "ff3":
+        if factor_names:
             fit = fit_factor_model(
                 window_frame.loc[est_mask, "ret"].to_numpy(dtype=float),
-                window_frame.loc[est_mask, ["fac_mkt", "fac_smb", "fac_hml"]].to_numpy(dtype=float),
+                window_frame.loc[est_mask, fac_cols].to_numpy(dtype=float),
             )
         else:
             fit_kind = "market_adjusted" if model == "market_adjusted" else "market"
-            fit = _fit_market_model(
-                window_frame.loc[est_mask, "ret"].to_numpy(dtype=float),
-                window_frame.loc[est_mask, "mkt_ret"].to_numpy(dtype=float),
-                fit_kind,
-            )
+            y_est = window_frame.loc[est_mask, "ret"].to_numpy(dtype=float)
+            x_est = window_frame.loc[est_mask, "mkt_ret"].to_numpy(dtype=float)
+            if market_lags and fit_kind == "market":
+                fit = _fit_dimson(y_est, x_est)
+            else:
+                fit = _fit_market_model(y_est, x_est, fit_kind)
         if fit is None or fit["n_est"] < min_estimation_obs:
             dropped_rows.append({"event_id": event.event_id, "reason": "few_estimation_obs"})
             continue
-        if model == "ff3":
-            factor_x = window_frame[["fac_mkt", "fac_smb", "fac_hml"]].to_numpy(dtype=float)
+        if factor_names:
+            factor_x = window_frame[fac_cols].to_numpy(dtype=float)
             predicted = fit["alpha"] + factor_x @ fit["betas"]
         else:
             predicted = fit["alpha"] + fit["beta"] * window_frame["mkt_ret"]
-        window_frame["ar"] = window_frame["ret"] - predicted
+        window_frame["predicted"] = predicted
+        window_frame["ar"] = window_frame["ret"] - window_frame["predicted"]
         window_frame["resid"] = np.where(est_mask, window_frame["ar"], np.nan)
         window_frame["event_id"] = event.event_id
         window_frame["firm_id"] = event.firm_id
@@ -351,23 +413,37 @@ def estimate_events(
         ret0 = float(day0.iloc[0]) if len(day0) else np.nan
         record["limit_band"] = band
         record["limit_hit"] = bool(is_limit_hit(ret0, band))
+        span_source = [item for item in windows if int(item[1]) >= 0] or list(windows)
+        span_left = min(int(item[0]) for item in span_source)
+        span_right = max(int(item[1]) for item in span_source)
+        span = window_frame[(window_frame["rel_day"] >= span_left) & (window_frame["rel_day"] <= span_right)]
+        span_rets = span["ret"].to_numpy(dtype=float)
+        span_hits = [is_limit_hit(float(value), band) for value in span_rets if np.isfinite(value)]
+        record["limit_hit_days"] = int(sum(span_hits))
+        record["limit_capped_end"] = bool(span_hits[-1]) if span_hits else False
         if fit.get("kind") == "factor":
-            record["beta_smb"] = float(fit["betas"][1])
-            record["beta_hml"] = float(fit["betas"][2])
+            for index, name in enumerate(factor_names):
+                if index == 0:
+                    continue
+                record[f"beta_{name}"] = float(fit["betas"][index])
         primary_ok = False
         for left_w, right_w in windows:
             piece = window_frame[(window_frame["rel_day"] >= left_w) & (window_frame["rel_day"] <= right_w)]
             complete = piece["ar"].notna().all() and len(piece) == (right_w - left_w + 1)
             key = window_suffix(left_w, right_w)
+            raw_ret = piece["ret"].to_numpy(dtype=float)
+            raw_pred = piece["predicted"].to_numpy(dtype=float)
+            buy_hold = np.isfinite(raw_ret) & np.isfinite(raw_pred)
             if require_complete_window and not complete:
                 record[f"car_{key}"] = np.nan
                 record[f"var_{key}"] = np.nan
                 record[f"scar_{key}"] = np.nan
+                record[f"bhar_{key}"] = np.nan
             else:
                 ar = piece["ar"].to_numpy(dtype=float)
                 rm = piece["mkt_ret"].to_numpy(dtype=float)
                 if fit.get("kind") == "factor":
-                    factor_piece = piece[["fac_mkt", "fac_smb", "fac_hml"]].to_numpy(dtype=float)
+                    factor_piece = piece[fac_cols].to_numpy(dtype=float)
                     usable = np.isfinite(ar) & np.isfinite(factor_piece).all(axis=1)
                     var_car = factor_car_variance(fit, factor_piece[usable]) if usable.any() else np.nan
                 else:
@@ -378,6 +454,10 @@ def estimate_events(
                 record[f"car_{key}"] = car
                 record[f"var_{key}"] = var_car
                 record[f"scar_{key}"] = scar
+                if buy_hold.any():
+                    record[f"bhar_{key}"] = float(np.prod(1.0 + raw_ret[buy_hold]) - np.prod(1.0 + raw_pred[buy_hold]))
+                else:
+                    record[f"bhar_{key}"] = np.nan
             if (left_w, right_w) == tuple(regression_window) and np.isfinite(record[f"car_{key}"]):
                 primary_ok = True
         path = window_frame[(window_frame["rel_day"] >= path_window[0]) & (window_frame["rel_day"] <= path_window[1])]
@@ -390,14 +470,26 @@ def estimate_events(
         if path_complete:
             ordered = path.sort_values("rel_day")
             window_frame.loc[ordered.index, "car_path"] = ordered["ar"].cumsum().to_numpy()
-        panel_rows.append(window_frame)
+        panel_rows.append(window_frame.drop(columns=["predicted"]))
         kept_rows.append(record)
 
-    generated = {"alpha", "beta", "sigma2", "n_est", "event_date_aligned", "rolled_forward", "path_complete"}
+    generated = {
+        "alpha",
+        "beta",
+        "sigma2",
+        "n_est",
+        "event_date_aligned",
+        "rolled_forward",
+        "path_complete",
+        "limit_band",
+        "limit_hit",
+        "limit_hit_days",
+        "limit_capped_end",
+    }
     meta_cols = [
         col
         for col in events.columns
-        if col not in generated and not col.startswith(("car_", "var_", "scar_"))
+        if col not in generated and not col.startswith(("car_", "var_", "scar_", "bhar_", "beta_"))
     ]
     base = events[meta_cols].copy()
     if kept_rows:
@@ -407,6 +499,42 @@ def estimate_events(
     dropped = pd.DataFrame(dropped_rows, columns=["event_id", "reason"])
     long = pd.concat(panel_rows, ignore_index=True) if panel_rows else pd.DataFrame()
     return Estimation(panel=long, events=kept, dropped=dropped, calendar=calendar)
+
+
+def winsorize_events(events: pd.DataFrame, rate: float) -> pd.DataFrame:
+    """Clip CAR and BHAR. Rate 0 leaves the frame unchanged. The path is not clipped."""
+    rate = float(rate or 0)
+    if rate <= 0 or events.empty:
+        return events
+    out = events.copy()
+    for column in list(out.columns):
+        if not str(column).startswith(("car_", "bhar_")):
+            continue
+        values = pd.to_numeric(out[column], errors="coerce").to_numpy(dtype=float)
+        finite = values[np.isfinite(values)]
+        if finite.size < 8:
+            continue
+        low, high = np.quantile(finite, [rate, 1.0 - rate])
+        clipped = values.copy()
+        mask = np.isfinite(clipped)
+        clipped[mask] = np.clip(clipped[mask], low, high)
+        out[column] = clipped
+        if not str(column).startswith("car_"):
+            continue
+        key = str(column)[4:]
+        var_col = f"var_{key}"
+        scar_col = f"scar_{key}"
+        if var_col not in out.columns or scar_col not in out.columns:
+            continue
+        variance = pd.to_numeric(out[var_col], errors="coerce").to_numpy(dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            scar = np.where(
+                np.isfinite(variance) & (variance > 0) & np.isfinite(clipped),
+                clipped / np.sqrt(variance),
+                np.nan,
+            )
+        out[scar_col] = scar
+    return out
 
 
 def add_peer_count(events: pd.DataFrame, days: int = 5) -> pd.DataFrame:

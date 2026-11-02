@@ -13,14 +13,54 @@ _MODELS = {
         "market_adjusted": "市场调整模型：事件窗收益直接减去基准收益，不估计截距和斜率",
         "industry": "行业基准的市场模型：斜率对着使用者提供的行业指数，而不是宽基指数",
         "ff3": "三因子模型：截距加上使用者提供的 mkt、smb 和 hml",
+        "ff5": "五因子模型：在三因子之外加上使用者提供的 rmw 和 cma",
+        "carhart": "Carhart 四因子：在三因子之外加上使用者提供的 umd",
     },
     "en": {
         "market": "a market model fitted in the estimation window",
         "market_adjusted": "a market-adjusted model that subtracts the benchmark return",
         "industry": "a market model whose benchmark is a user-supplied industry index",
         "ff3": "a three-factor model using user-supplied mkt, smb, and hml",
+        "ff5": "a five-factor model that also uses user-supplied rmw and cma",
+        "carhart": "a Carhart model that also uses a user-supplied umd factor",
     },
 }
+
+
+def _supplement_zh(cfg: StudyConfig) -> str:
+    parts = [
+        "BHAR 与 CAR 分列存放，不互相替代。日历时间 t、广义符号 z 和 KP 调整后的秩检验写在补充表里，不改变首选规则，也不进入 BH。"
+    ]
+    if cfg.anticipation_window is not None:
+        parts.append(
+            f"预事件窗 {window_label(*cfg.anticipation_window)} 单独计算，不因此剔除事件。"
+        )
+    if float(cfg.winsorize or 0) > 0:
+        parts.append("横截面 CAR 和 BHAR 做了缩尾。安慰剂对照的是缩尾前的平均 CAR。路径没有缩尾。")
+    if int(cfg.market_lags or 0):
+        parts.append(
+            "估计窗加入市场收益的前一日和后一日，斜率相加。事件窗预测只用同期市场收益。方差仍按单指数公式，这是近似。"
+        )
+    return "".join(parts)
+
+
+def _supplement_en(cfg: StudyConfig) -> str:
+    parts = [
+        "BHAR is stored beside CAR. Calendar-time t, the generalized sign z, and the KP-adjusted rank t are supplements. "
+        "They do not change the preferred test or enter the BH adjustment."
+    ]
+    if cfg.anticipation_window is not None:
+        parts.append(
+            f" The pre-event window {window_label(*cfg.anticipation_window)} is reported separately and does not drop events."
+        )
+    if float(cfg.winsorize or 0) > 0:
+        parts.append(" Cross-sectional CAR and BHAR are winsorized. Placebos use the pre-winsor mean. The path is not winsorized.")
+    if int(cfg.market_lags or 0):
+        parts.append(
+            " The estimation window adds one market lead and one lag, and the slopes are summed. "
+            "The event-window forecast uses only the same-day market return. Variance stays the single-index formula."
+        )
+    return "".join(parts)
 
 
 def render_methods(
@@ -73,6 +113,7 @@ def render_methods(
                 "系数是累计异常收益和公司特征的相关。市场模型异常收益不是平均处理效应。"
             ),
             "事件日若靠近按板块推断的涨跌停带宽，会在样本日志里计数。这是启发式标记，不是交易所的涨跌停状态表，程序不因此删行。",
+            _supplement_zh(cfg),
         ]
     )
     en = "\n".join(
@@ -109,6 +150,7 @@ def render_methods(
                 "Coefficients are associations. A market-model abnormal return is not an average treatment effect."
             ),
             "Days close to a heuristic price-limit band are counted in the sample log and are not dropped.",
+            _supplement_en(cfg),
         ]
     )
     return zh + "\n", en + "\n"

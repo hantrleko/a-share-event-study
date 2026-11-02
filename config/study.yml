@@ -43,7 +43,7 @@ seed: 20240101
 mode: demo   # demo | local | akshare
 language: zh # zh | en
 
-model: market  # market | market_adjusted | industry | ff3
+model: market  # market | market_adjusted | industry | ff3 | ff5 | carhart
 benchmark: "000300"
 adjust: qfq
 
@@ -54,6 +54,9 @@ event_windows:
   - [-5, 5]
 path_window: [-10, 10]
 regression_window: [-1, 1]
+anticipation_window: [-10, -6]  # reported separately; not in BH and not a reason to drop an event
+winsorize: 0                    # 0 leaves CAR unchanged; 0.01 clips the outer 1 percent when N>=8
+market_lags: 0                  # 1 adds one market lead and one lag in the estimation window only
 min_estimation_obs: 80
 require_complete_window: true
 

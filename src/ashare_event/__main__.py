@@ -2,6 +2,7 @@
 
     python -m ashare_event demo
     python -m ashare_event run --config config/study.yml --event-type esg --window -1 1
+    python -m ashare_event robustness --config config/study.yml --demo
 """
 
 from __future__ import annotations
@@ -23,12 +24,29 @@ def _parser() -> argparse.ArgumentParser:
         item.add_argument("--event-type", action="append", default=None)
         item.add_argument("--window", nargs=2, type=int, default=None, metavar=("START", "END"))
         item.add_argument("--no-placebo", action="store_true")
+    robust = sub.add_parser("robustness", help="另跑模型、缩尾和估计窗对照")
+    robust.add_argument("--config", default="config/study.yml")
+    robust.add_argument("--demo", action="store_true", help="强制使用模拟样本")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     config = Path(args.config)
+    if args.command == "robustness":
+        from ashare_event.config import load_config
+        from ashare_event.robustness import run_robustness
+
+        cfg_path = config if config.exists() else Path(__file__).resolve().parents[2] / "config" / "study.yml"
+        cfg = load_config(cfg_path)
+        if args.demo:
+            cfg.mode = "demo"
+        frame = run_robustness(cfg)
+        dest = cfg.resolve(cfg.paths.get("processed", "data/processed")) / "robustness.csv"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(dest, index=False)
+        print(dest)
+        return
     if args.command == "demo":
         from ashare_event.config import load_config
 

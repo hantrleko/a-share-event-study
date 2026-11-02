@@ -48,11 +48,12 @@ from ashare_event.market import (
 from ashare_event.methods_text import render_methods
 from ashare_event.placebo import run_placebos
 from ashare_event.regression import fit_car_regressions, regression_covariates
-from ashare_event.returns import add_peer_count, estimate_events
+from ashare_event.returns import add_peer_count, estimate_events, winsorize_events
 from ashare_event.schema import read_events_csv
 from ashare_event.simulate import simulate
 from ashare_event.tables import (
     car_table,
+    diagnostics_table,
     placebo_table,
     regression_table,
     summary_table,
@@ -82,6 +83,7 @@ class StudyResult:
     groups: dict = field(default_factory=dict)
     vif: pd.DataFrame | None = None
     dictionary: pd.DataFrame | None = None
+    anticipation: dict | None = None
 
 
 def _load_inputs(
@@ -189,9 +191,13 @@ def _sample_log(cfg: StudyConfig, loaded: int, filtered: int, estimation, tests:
         f"- 回归窗：{list(cfg.regression_window)}",
         f"- 聚类：{cfg.cluster}",
         f"- 双向聚类：{'是' if cfg.two_way_cluster else '否'}",
+        f"- 预事件窗口：{list(cfg.anticipation_window) if cfg.anticipation_window else '不计算'}",
+        f"- 缩尾：{cfg.winsorize or 0}",
+        f"- 市场领先滞后：{int(cfg.market_lags)}",
         "",
         "市场模型异常收益不是平均处理效应。横截面 t 不是首选检验。",
         "多个窗口和分组上的星号没有做多重检验校正。p BH 只调整窗口表里的首选 p 值。",
+        "日历时间 t、广义符号 z 和 KP 调整后的秩检验是补充列，不改变首选规则。BHAR 与 CAR 分列存放。",
         "",
     ]
     if "limit_hit" in kept.columns and len(kept):
@@ -199,6 +205,11 @@ def _sample_log(cfg: StudyConfig, loaded: int, filtered: int, estimation, tests:
         lines.append(
             f"- 事件日涨跌幅靠近涨跌停带宽：{n_hit}。"
             "这是按代码板块和公司名称做的启发式标记，不是交易所涨跌停状态表，程序没有因此删行。"
+        )
+    if "limit_hit_days" in kept.columns and len(kept):
+        lines.append(
+            f"- 事件窗内涨跌停天数合计：{int(pd.to_numeric(kept['limit_hit_days'], errors='coerce').fillna(0).sum())}。"
+            "事件日当天的 limit_hit 仍单独保留。"
         )
     if "rolled_forward" in kept.columns and len(kept):
         lines.append(f"- 事件日向后对齐：{int(kept['rolled_forward'].astype(bool).sum())}。原因可以是周末、节假日，或盘后公告。")
@@ -260,12 +271,15 @@ def run_study(
         market_frame=market_frame,
     )
     _step("estimate")
+    compute_windows = list(cfg.event_windows)
+    if cfg.anticipation_window is not None and tuple(cfg.anticipation_window) not in compute_windows:
+        compute_windows.append(tuple(cfg.anticipation_window))
     estimation = estimate_events(
         filtered,
         prices,
         market,
         estimation_window=cfg.estimation_window,
-        event_windows=cfg.event_windows,
+        event_windows=compute_windows,
         path_window=cfg.path_window,
         regression_window=cfg.regression_window,
         model=cfg.model,
@@ -273,6 +287,7 @@ def run_study(
         require_complete_window=cfg.require_complete_window,
         industry_frame=industry_frame,
         factors_frame=factors_frame,
+        market_lags=int(cfg.market_lags or 0),
     )
     if estimation.events.empty:
         counts = estimation.dropped["reason"].value_counts().to_dict()
@@ -280,6 +295,9 @@ def run_study(
     events = add_peer_count(estimation.events)
     events["year"] = pd.to_datetime(events["event_date"]).dt.year.astype(int)
     suffix = window_suffix(*cfg.regression_window)
+    raw_events = events
+    if float(cfg.winsorize or 0) > 0:
+        events = winsorize_events(events, float(cfg.winsorize))
     r_bar = mean_residual_correlation(estimation.panel, events["event_id"], cfg.rbar_min_periods)
     _step("tests")
     rows = []
@@ -297,6 +315,18 @@ def run_study(
             )
         )
     tests = pd.DataFrame(rows)
+    anticipation = None
+    if cfg.anticipation_window is not None:
+        anticipation = summarize_window(
+            events,
+            estimation.panel,
+            tuple(cfg.anticipation_window),
+            window_suffix(*cfg.anticipation_window),
+            estimation_window=cfg.estimation_window,
+            model=cfg.model,
+            r_bar=r_bar,
+            min_share=cfg.portfolio_min_share,
+        )
     if not tests.empty:
         tests["p_bh"] = bh_adjust(tests["p_preferred"].to_numpy(dtype=float))
     path = _path_table(estimation.panel)
@@ -317,7 +347,7 @@ def run_study(
     dictionary = variable_dictionary(events, [f"car_{suffix}", *covariates], cfg.language)
     if not vif.empty and float(pd.to_numeric(vif["vif"], errors="coerce").max() or 0) > 10:
         regression_notes.append("有变量的 VIF 超过 10，这些系数会不稳。VIF 不是删变量的因果标准。")
-    actual = float(events[f"car_{suffix}"].mean())
+    actual = float(raw_events[f"car_{suffix}"].mean())
     placebos = {}
     if run_placebo and cfg.placebo_draws > 0:
         _step("placebo")
@@ -338,6 +368,17 @@ def run_study(
         cfg.language,
     )
     log = _sample_log(cfg, loaded_n, len(filtered), estimation, tests, simulated)
+    if cfg.anticipation_window is not None:
+        left, right = cfg.anticipation_window
+        overlap = any(not (right < window[0] or window[1] < left) for window in cfg.event_windows)
+        if overlap:
+            log += "\n预事件窗口和某个报告窗有重叠。预事件行仍单独列出，不进入 BH，也不因此剔除事件。\n"
+        else:
+            log += "\n预事件窗口单独计算，不进入窗口表的 BH，也不因此剔除事件。\n"
+    if int(cfg.market_lags or 0):
+        log += "\n估计窗加入市场收益的前一日和后一日，斜率相加。事件窗预测只用同期市场收益。方差仍按单指数公式。\n"
+    if float(cfg.winsorize or 0) > 0:
+        log += "\n横截面 CAR 和 BHAR 做了缩尾。安慰剂对照的是缩尾前的平均 CAR。路径没有缩尾。\n"
     if regression_notes:
         log += "\n## 回归样本\n\n" + "\n".join(f"- {line}" for line in regression_notes) + "\n"
     for pack in placebos.values():
@@ -371,6 +412,7 @@ def run_study(
         groups=groups,
         vif=vif,
         dictionary=dictionary,
+        anticipation=anticipation,
     )
     if export:
         _step("export")
@@ -427,6 +469,17 @@ def export_result(result: StudyResult, dest: str | Path | None = None) -> dict[s
         paths["tables"] / "table_placebo.tex",
         placebo_table(result.placebos, cfg.language, cfg.return_scale, result.simulated),
     )
+    write_text(
+        paths["tables"] / "table_diagnostics.tex",
+        diagnostics_table(
+            result.tests,
+            result.events,
+            getattr(result, "anticipation", None),
+            cfg.language,
+            cfg.return_scale,
+            result.simulated,
+        ),
+    )
     captions = {
         "fig:car_path": save_car_path(
             result.path,
@@ -471,6 +524,9 @@ def export_result(result: StudyResult, dest: str | Path | None = None) -> dict[s
             paths["processed"] / "SIMULATED.txt",
             "SIMULATED DATA\nevent_car 来自模拟路径。不能作为实证证据，不能写入论文。\n",
         )
+    from ashare_event.replication import write_replication
+
+    write_replication(result, paths["logs"] / "replication")
     result.outputs = {key: str(value) for key, value in paths.items()}
     result.manifest = build_manifest(result)
     write_text(paths["logs"] / "manifest.json", json.dumps(result.manifest, ensure_ascii=False, indent=2))

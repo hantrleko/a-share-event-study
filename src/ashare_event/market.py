@@ -261,7 +261,7 @@ def read_factor_frame(frame: pd.DataFrame) -> pd.DataFrame:
     smb = _find_column(frame, {"smb", "规模", "规模因子"})
     hml = _find_column(frame, {"hml", "价值", "价值因子"})
     if dated is None or mkt is None or smb is None or hml is None:
-        raise MarketDataError("三因子文件需要日期、mkt、smb、hml。")
+        raise MarketDataError("因子文件至少需要日期、mkt、smb、hml。五因子再加 rmw、cma，Carhart 再加 umd。")
     out = pd.DataFrame(
         {
             "date": pd.to_datetime(frame[dated], errors="coerce").dt.normalize(),
@@ -269,9 +269,19 @@ def read_factor_frame(frame: pd.DataFrame) -> pd.DataFrame:
             "smb": pd.to_numeric(frame[smb], errors="coerce"),
             "hml": pd.to_numeric(frame[hml], errors="coerce"),
         }
-    ).dropna()
+    )
+    optional = {
+        "rmw": {"rmw", "盈利", "盈利因子"},
+        "cma": {"cma", "投资", "投资因子"},
+        "umd": {"umd", "mom", "动量", "动量因子"},
+    }
+    for name, aliases in optional.items():
+        column = _find_column(frame, aliases)
+        if column is not None:
+            out[name] = pd.to_numeric(frame[column], errors="coerce")
+    out = out.dropna(subset=["date", "mkt", "smb", "hml"])
     if out.empty:
-        raise MarketDataError("三因子文件里没有同时有日期和三个因子的行。")
+        raise MarketDataError("因子文件里没有同时有日期、mkt、smb、hml 的行。")
     return out.drop_duplicates("date").sort_values("date").reset_index(drop=True)
 
 
@@ -279,11 +289,14 @@ def prepare_factors(frame: pd.DataFrame | None) -> pd.DataFrame | None:
     if frame is None or len(frame) == 0:
         return None
     if {"date", "mkt", "smb", "hml"}.issubset(frame.columns):
-        out = frame[["date", "mkt", "smb", "hml"]].copy()
+        columns = ["date", "mkt", "smb", "hml", *[name for name in ("rmw", "cma", "umd") if name in frame.columns]]
+        out = frame[columns].copy()
         out["date"] = pd.to_datetime(out["date"]).dt.normalize()
-        for column in ("mkt", "smb", "hml"):
+        for column in columns:
+            if column == "date":
+                continue
             out[column] = pd.to_numeric(out[column], errors="coerce")
-        return out.dropna().drop_duplicates("date")
+        return out.dropna(subset=["date", "mkt", "smb", "hml"]).drop_duplicates("date")
     return read_factor_frame(frame)
 
 
