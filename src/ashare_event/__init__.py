@@ -4,4 +4,4 @@ Market-model abnormal returns are a statistical benchmark.
 They are not an average treatment effect.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"

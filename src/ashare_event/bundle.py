@@ -77,7 +77,22 @@ def build_zip(result) -> bytes:
                 if path.stat().st_size >= 800:
                     archive.writestr(f"png/{path.name}", path.read_bytes())
         from ashare_event.replication import replication_files
+        from ashare_event.tables import attrition_table
 
+        dropped = getattr(result, "dropped_events", None)
+        if not isinstance(dropped, pd.DataFrame):
+            dropped = pd.DataFrame(
+                columns=["event_id", "code", "event_date", "firm_name", "reason", "reason_zh", "failed_window"]
+            )
+        archive.writestr("csv/dropped_events.csv", dropped.to_csv(index=False).encode("utf-8-sig"))
+        attrition = getattr(result, "attrition", None)
+        if (
+            isinstance(attrition, pd.DataFrame)
+            and len(attrition)
+            and "tex/table_attrition.tex" not in archive.namelist()
+        ):
+            tex = attrition_table(attrition, cfg.language, bool(getattr(result, "simulated", False)))
+            archive.writestr("tex/table_attrition.tex", tex.encode("utf-8"))
         for name, payload in replication_files(result).items():
             archive.writestr(name, payload)
     return buf.getvalue()

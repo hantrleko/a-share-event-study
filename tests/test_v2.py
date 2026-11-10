@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -231,3 +233,56 @@ class VersionTwoTests(unittest.TestCase):
             text = (root / "tables" / "table_diagnostics.tex").read_text(encoding="utf-8")
             self.assertIn("BHAR", text)
             self.assertNotIn(str(root), (root / "logs" / "replication" / "study_repro.yml").read_text(encoding="utf-8"))
+
+    def test_dropped_row_is_listed_and_attrition_sums(self):
+        events, prices, market, _dates = synthetic(drop_event_row=True)
+        estimated = _fit(events, prices, market)
+        incomplete = estimated.dropped[estimated.dropped["reason"] == "incomplete_window"]
+        self.assertEqual(len(incomplete), 1)
+        self.assertEqual(len(estimated.events), 0)
+        self.assertEqual(str(incomplete.iloc[0]["code"]), "000001")
+        self.assertEqual(str(incomplete.iloc[0]["failed_window"]), "[0, 0]")
+
+        events, prices, market, _dates = synthetic(n_firms=2, shocks=[0.02, 0.02], event_locs=[180, 180])
+        cfg = _cfg()
+        cfg.mode = "local"
+        cfg.event_windows = [(0, 0)]
+        cfg.regression_window = (0, 0)
+        cfg.path_window = (-10, 10)
+        cfg.anticipation_window = None
+        cfg.winsorize = 0
+        cfg.market_lags = 0
+        cfg.placebo_draws = 0
+        cfg.wild_draws = 0
+        cfg.two_way_cluster = False
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_study(
+                cfg,
+                industries=["电子"],
+                run_placebo=False,
+                export=True,
+                output_dir=tmp,
+                events_frame=events,
+                prices_frame=prices,
+                market_frame=market,
+            )
+            attr = result.attrition
+            total = int(attr.loc[attr["step"] == "读入", "n"].iloc[0])
+            part = int(attr.loc[attr["step"] != "读入", "n"].sum())
+            self.assertEqual(total, part)
+            self.assertEqual(total, 2)
+            self.assertEqual(len(result.events), 1)
+            self.assertAlmostEqual(float(result.events["car_p0_p0"].iloc[0]), 0.02, places=6)
+            root = Path(tmp)
+            tex = (root / "tables" / "table_attrition.tex").read_text(encoding="utf-8")
+            self.assertIn("读入", tex)
+            self.assertIn("进入 CAR", tex)
+            dropped_csv = (root / "processed" / "dropped_events.csv").read_text(encoding="utf-8")
+            self.assertIn("000002", dropped_csv)
+            self.assertIn("screened", dropped_csv)
+            payload = build_zip(result)
+            self.assertIn(b"dropped_events.csv", payload)
+            archive = zipfile.ZipFile(io.BytesIO(payload))
+            self.assertIn("csv/dropped_events.csv", archive.namelist())
+            self.assertIn("tex/table_attrition.tex", archive.namelist())
+            self.assertIn("进入 CAR", archive.read("tex/table_attrition.tex").decode("utf-8"))

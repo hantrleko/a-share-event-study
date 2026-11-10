@@ -1318,7 +1318,13 @@ if run or pending or st.session_state.get("study_result") is not None:
               )
       file_cols = st.columns(2)
       saved = Path(result.outputs["tables"])
-      names = ["table_car.tex", "table_summary.tex", "table_regression.tex", "table_placebo.tex"]
+      names = [
+          "table_car.tex",
+          "table_summary.tex",
+          "table_regression.tex",
+          "table_placebo.tex",
+          "table_attrition.tex",
+      ]
       for index, name in enumerate(names):
           file_path = saved / name
           if file_path.exists() and file_path.read_text(encoding="utf-8").strip():
@@ -1361,6 +1367,24 @@ if run or pending or st.session_state.get("study_result") is not None:
       file_cols[1].download_button("下载事件层 CAR CSV", event_csv, "event_car.csv", "text/csv", **_stretch(st.download_button), key="dl-event-csv")
       with st.expander("样本怎么筛出来的"):
           st.markdown(result.sample_log)
+          attrition = getattr(result, "attrition", None)
+          if isinstance(attrition, pd.DataFrame) and len(attrition):
+              counts = attrition.rename(columns={"step": "步骤", "n": "人数"})[["步骤", "人数"]]
+              st.dataframe(counts, hide_index=True, **_stretch(st.dataframe))
+              st.caption("这些行没有进入 CAR。除读入以外的人数相加等于读入数。这张表不改变 CAR。")
+          dropped = getattr(result, "dropped_events", None)
+          if isinstance(dropped, pd.DataFrame) and len(dropped):
+              view = dropped.rename(
+                  columns={
+                      "code": "代码",
+                      "event_date": "事件日",
+                      "firm_name": "公司",
+                      "reason_zh": "原因",
+                      "failed_window": "未完成的窗口",
+                  }
+              )
+              columns = [name for name in ["代码", "事件日", "公司", "原因", "未完成的窗口"] if name in view.columns]
+              st.dataframe(view[columns], hide_index=True, **_stretch(st.dataframe))
 else:
     step_a, step_b, step_c = st.columns(3)
     with step_a.container(border=True):

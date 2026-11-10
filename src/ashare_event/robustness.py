@@ -75,7 +75,7 @@ def run_robustness(
 
     cfg = clone_config(cfg)
     rng = np.random.default_rng(cfg.seed)
-    filtered, prices, market, _simulated, _loaded = _load_inputs(
+    filtered, prices, market, _simulated, _loaded, _screened = _load_inputs(
         cfg,
         rng,
         industries,

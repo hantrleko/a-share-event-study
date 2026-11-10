@@ -435,6 +435,75 @@ def diagnostics_table(
     return _wrap_table(caption, "tab:diagnostics", tabular, notes)
 
 
+DROP_LABELS = {
+    "zh": {
+        "loaded": "读入",
+        "kept": "进入 CAR",
+        "screened": "不在所选行业或事件类型里",
+        "no_price": "没有行情",
+        "outside_calendar": "对不上基准交易日",
+        "short_history": "估计窗不够长",
+        "no_industry_benchmark": "没有这家公司的行业指数",
+        "few_estimation_obs": "估计窗里的有效天数不够",
+        "incomplete_window": "事件窗不完整",
+    },
+    "en": {
+        "loaded": "Events read",
+        "kept": "Enter the CAR sample",
+        "screened": "Outside the selected industry or event type",
+        "no_price": "No price series",
+        "outside_calendar": "No benchmark trading day within 10 calendar days",
+        "short_history": "Estimation window does not fit",
+        "no_industry_benchmark": "No industry index for this firm",
+        "few_estimation_obs": "Too few estimation observations",
+        "incomplete_window": "Event window is incomplete",
+    },
+}
+DROP_REASON_ORDER = (
+    "screened",
+    "no_price",
+    "outside_calendar",
+    "short_history",
+    "few_estimation_obs",
+    "no_industry_benchmark",
+    "incomplete_window",
+)
+
+
+def attrition_table(frame: pd.DataFrame, language: str, simulated: bool) -> str:
+    """Sample counts. Every row except the first sums to the number of events read."""
+    header = " & ".join(["步骤" if language == "zh" else "Step", "人数" if language == "zh" else "N"])
+    body = [header + r" \\"]
+    for row in frame.itertuples(index=False):
+        body.append(f"{tex_escape(row.step)} & {int(row.n)}" + r" \\")
+    tabular = "\n".join(
+        [
+            "\\begin{tabular}{lr}",
+            "\\toprule",
+            body[0],
+            "\\midrule",
+            *body[1:],
+            "\\bottomrule",
+            "\\end{tabular}",
+        ]
+    )
+    if language == "zh":
+        notes = [
+            "除第一行外，各行人数相加等于读入人数。",
+            "这张表只交代哪些行没有进入累计异常收益，不改变 CAR、BHAR 或首选检验。",
+        ]
+        caption = "样本筛选"
+    else:
+        notes = [
+            "Every row except the first sums to the number of events read.",
+            "The table records which rows never enter CAR. It does not change CAR, BHAR, or the preferred test.",
+        ]
+        caption = "Sample attrition"
+    if simulated:
+        notes.insert(0, text(language, "simulated"))
+    return _wrap_table(caption, "tab:attrition", tabular, notes)
+
+
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")

@@ -52,6 +52,9 @@ from ashare_event.returns import add_peer_count, estimate_events, winsorize_even
 from ashare_event.schema import read_events_csv
 from ashare_event.simulate import simulate
 from ashare_event.tables import (
+    DROP_LABELS,
+    DROP_REASON_ORDER,
+    attrition_table,
     car_table,
     diagnostics_table,
     placebo_table,
@@ -84,6 +87,8 @@ class StudyResult:
     vif: pd.DataFrame | None = None
     dictionary: pd.DataFrame | None = None
     anticipation: dict | None = None
+    dropped_events: pd.DataFrame | None = None
+    attrition: pd.DataFrame | None = None
 
 
 def _load_inputs(
@@ -95,7 +100,7 @@ def _load_inputs(
     prices_frame: pd.DataFrame | None = None,
     market_frame: pd.DataFrame | None = None,
 ):
-    """Return filtered events, prices, market, simulated flag, and the pre-filter count."""
+    """Return kept events, prices, market, simulated flag, the pre-filter count, and screened rows."""
     if cfg.mode == "demo":
         events, prices, market = simulate(cfg, rng)
         simulated = True
@@ -118,7 +123,7 @@ def _load_inputs(
     else:
         raise ValueError(cfg.mode)
     loaded_n = len(events)
-    events = _filter(events, industries, event_types)
+    events, screened = _filter(events, industries, event_types)
     if events.empty:
         raise ValueError("筛选之后没有事件。放宽行业或事件类型。")
     if cfg.mode == "akshare":
@@ -137,7 +142,7 @@ def _load_inputs(
                 frames = list(pool.map(_one, codes))
         prices = pd.concat(frames, ignore_index=True)
         market = load_or_download_index(cfg.benchmark, start, end, raw)
-    return events, prices, market, simulated, loaded_n
+    return events, prices, market, simulated, loaded_n, screened
 
 
 def _events_from_request(cfg: StudyConfig, events_frame: pd.DataFrame | None) -> pd.DataFrame:
@@ -152,13 +157,59 @@ def _events_from_request(cfg: StudyConfig, events_frame: pd.DataFrame | None) ->
     return read_events_csv(cfg.resolve(cfg.events_file))
 
 
-def _filter(events: pd.DataFrame, industries, event_types) -> pd.DataFrame:
-    out = events
+def _filter(events: pd.DataFrame, industries, event_types) -> tuple[pd.DataFrame, pd.DataFrame]:
+    mask = pd.Series(True, index=events.index)
     if industries is not None:
-        out = out[out["industry"].isin(list(industries))]
+        mask = mask & events["industry"].isin(list(industries))
     if event_types is not None:
-        out = out[out["event_type"].isin(list(event_types))]
-    return out.reset_index(drop=True)
+        mask = mask & events["event_type"].isin(list(event_types))
+    return events.loc[mask].reset_index(drop=True), events.loc[~mask].reset_index(drop=True)
+
+
+def _sample_account(loaded: int, screened: pd.DataFrame, estimation, language: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Row-level drops and the count table. Every row except the first sums to ``loaded``."""
+    labels = DROP_LABELS.get(language, DROP_LABELS["zh"])
+    detail = ["event_id", "code", "event_date", "firm_name", "reason", "failed_window"]
+    pieces: list[pd.DataFrame] = []
+    if screened is not None and len(screened):
+        rows = []
+        for event in screened.itertuples(index=False):
+            name = getattr(event, "firm_name", "")
+            if name is None or (isinstance(name, float) and np.isnan(name)):
+                name = ""
+            stamp = pd.to_datetime(getattr(event, "event_date", None), errors="coerce")
+            rows.append(
+                {
+                    "event_id": getattr(event, "event_id", ""),
+                    "code": str(getattr(event, "code", "")).zfill(6)[-6:],
+                    "event_date": "" if pd.isna(stamp) else pd.Timestamp(stamp).strftime("%Y-%m-%d"),
+                    "firm_name": str(name),
+                    "reason": "screened",
+                    "failed_window": "",
+                }
+            )
+        pieces.append(pd.DataFrame(rows, columns=detail))
+    estimated_drop = estimation.dropped
+    if estimated_drop is not None and len(estimated_drop):
+        pieces.append(estimated_drop.reindex(columns=detail))
+    dropped = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame(columns=detail)
+    dropped["reason_zh"] = dropped["reason"].map(labels).fillna(dropped["reason"])
+    counts = dropped["reason"].value_counts().to_dict() if len(dropped) else {}
+    account = [{"step": labels["loaded"], "n": int(loaded), "reason": "loaded"}]
+    seen: set[str] = set()
+    for reason in (*DROP_REASON_ORDER, *(str(key) for key in counts)):
+        if reason in seen:
+            continue
+        seen.add(reason)
+        count = int(counts.get(reason, 0))
+        if count:
+            account.append({"step": labels.get(reason, reason), "n": count, "reason": reason})
+    account.append({"step": labels["kept"], "n": int(len(estimation.events)), "reason": "kept"})
+    attrition = pd.DataFrame(account, columns=["step", "n", "reason"])
+    part = int(attrition.loc[attrition["reason"] != "loaded", "n"].sum())
+    if part != int(loaded):
+        raise ValueError(f"样本人数对不上：读入 {loaded}，分项合计 {part}。")
+    return dropped, attrition
 
 
 def _path_table(panel: pd.DataFrame) -> pd.DataFrame:
@@ -184,6 +235,7 @@ def _sample_log(cfg: StudyConfig, loaded: int, filtered: int, estimation, tests:
         f"- 读入事件：{loaded}",
         f"- 筛选后事件：{filtered}",
         f"- 进入 CAR 的事件：{len(kept)}",
+        "- 筛选和剔除的分项人数相加等于读入人数。明细在 dropped_events.csv，不改变谁进入 CAR。",
         f"- 公司数：{kept['firm_id'].nunique() if len(kept) else 0}",
         f"- 剔除：{reasons or '无'}",
         f"- 模型：{cfg.model}",
@@ -261,7 +313,7 @@ def run_study(
             on_step(key)
 
     _step("inputs")
-    filtered, prices, market, simulated, loaded_n = _load_inputs(
+    filtered, prices, market, simulated, loaded_n, screened = _load_inputs(
         cfg,
         rng,
         industries,
@@ -292,6 +344,7 @@ def run_study(
     if estimation.events.empty:
         counts = estimation.dropped["reason"].value_counts().to_dict()
         raise ValueError(f"没有事件通过估计窗和事件窗。剔除原因：{counts}")
+    dropped_events, attrition = _sample_account(loaded_n, screened, estimation, cfg.language)
     events = add_peer_count(estimation.events)
     events["year"] = pd.to_datetime(events["event_date"]).dt.year.astype(int)
     suffix = window_suffix(*cfg.regression_window)
@@ -413,6 +466,8 @@ def run_study(
         vif=vif,
         dictionary=dictionary,
         anticipation=anticipation,
+        dropped_events=dropped_events,
+        attrition=attrition,
     )
     if export:
         _step("export")
@@ -505,6 +560,13 @@ def export_result(result: StudyResult, dest: str | Path | None = None) -> dict[s
         write_text(paths["theory"] / "methods_zh.md", result.methods_zh)
     if result.methods_en:
         write_text(paths["theory"] / "methods_en.md", result.methods_en)
+    if result.attrition is not None and len(result.attrition):
+        write_text(
+            paths["tables"] / "table_attrition.tex",
+            attrition_table(result.attrition, cfg.language, result.simulated),
+        )
+    if result.dropped_events is not None:
+        result.dropped_events.to_csv(paths["processed"] / "dropped_events.csv", index=False)
     write_text(paths["logs"] / "sample_log.md", result.sample_log)
     frame = result.events.copy()
     frame["simulated"] = result.simulated

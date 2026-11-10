@@ -6,7 +6,7 @@
 
 ## 在线使用
 
-打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。当前版本 V2.0。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。网站上的每次运行写到单独的临时目录，不会改服务器上的 `paper/`。命令行不传输出目录时，仍写到配置里的 `paper/tabs`、`paper/figs`。
+打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。当前版本 V2.1。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。网站上的每次运行写到单独的临时目录，不会改服务器上的 `paper/`。命令行不传输出目录时，仍写到配置里的 `paper/tabs`、`paper/figs`。样本记录现在有逐行剔除名单，人数表的分项相加等于读入人数，不改变 CAR。
 
 ## 先跑演示
 
@@ -33,7 +33,7 @@ streamlit run app/streamlit_app.py
 
 切到「我的事件表」后，可以下载带两套示例事件的 CSV，或只下载当前表头。示例是政策发布日，公司名带「示例」。名称里还有这两个字时，运行按钮会停用，AKShare 也不会下载。核对后再删掉。命令行仍可读 `config/study.yml`。
 
-表在 `paper/tabs/*.tex`，图在 `paper/figs/*.pdf`。论文里 `\input` 这些 tex，不要手抄数字。方法段骨架在 `paper/snippets/methods_skeleton.tex`。样本怎么被筛掉，写在 `output/logs/sample_log.md`。
+表在 `paper/tabs/*.tex`，图在 `paper/figs/*.pdf`。论文里 `\input` 这些 tex，不要手抄数字。方法段骨架在 `paper/snippets/methods_skeleton.tex`。样本怎么被筛掉，写在 `output/logs/sample_log.md`。逐行原因在 `data/processed/dropped_events.csv`，人数表在 `paper/tabs/table_attrition.tex`。
 
 ## 默认设定
 

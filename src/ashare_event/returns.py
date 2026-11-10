@@ -329,21 +329,37 @@ def estimate_events(
     dropped_rows: list[dict] = []
     panel_rows: list[pd.DataFrame] = []
 
+    def _drop(event, reason: str, failed_window: str = "") -> None:
+        name = getattr(event, "firm_name", "")
+        if name is None or (isinstance(name, float) and np.isnan(name)):
+            name = ""
+        stamp = pd.to_datetime(getattr(event, "event_date", None), errors="coerce")
+        dropped_rows.append(
+            {
+                "event_id": event.event_id,
+                "code": str(event.code).zfill(6)[-6:],
+                "event_date": "" if pd.isna(stamp) else pd.Timestamp(stamp).strftime("%Y-%m-%d"),
+                "firm_name": str(name),
+                "reason": reason,
+                "failed_window": failed_window,
+            }
+        )
+
     for event in events.itertuples(index=False):
         code = str(event.code).zfill(6)[-6:]
         firm_ret = by_code.get(code)
         if firm_ret is None or firm_ret.empty:
-            dropped_rows.append({"event_id": event.event_id, "reason": "no_price"})
+            _drop(event, "no_price")
             continue
         aligned = _align(calendar, event.event_date, after=parse_after_close(getattr(event, "after_close", False)))
         if aligned is None:
-            dropped_rows.append({"event_id": event.event_id, "reason": "outside_calendar"})
+            _drop(event, "outside_calendar")
             continue
         pos, aligned_date = aligned
         left = pos + slice_left
         right = pos + slice_right
         if pos + est_left < 0 or pos + est_right >= len(calendar):
-            dropped_rows.append({"event_id": event.event_id, "reason": "short_history"})
+            _drop(event, "short_history")
             continue
         if left < 0:
             left = 0
@@ -361,7 +377,7 @@ def estimate_events(
         if model == "industry":
             series = industry_map.get(str(getattr(event, "industry", "")))
             if series is None:
-                dropped_rows.append({"event_id": event.event_id, "reason": "no_industry_benchmark"})
+                _drop(event, "no_industry_benchmark")
                 continue
             window_frame["mkt_ret"] = series.reindex(window_frame["date"]).to_numpy(dtype=float)
         fac_cols = [f"fac_{name}" for name in factor_names]
@@ -385,7 +401,7 @@ def estimate_events(
             else:
                 fit = _fit_market_model(y_est, x_est, fit_kind)
         if fit is None or fit["n_est"] < min_estimation_obs:
-            dropped_rows.append({"event_id": event.event_id, "reason": "few_estimation_obs"})
+            _drop(event, "few_estimation_obs")
             continue
         if factor_names:
             factor_x = window_frame[fac_cols].to_numpy(dtype=float)
@@ -464,7 +480,7 @@ def estimate_events(
         path_complete = path["ar"].notna().all() and len(path) == (path_window[1] - path_window[0] + 1)
         record["path_complete"] = bool(path_complete)
         if not primary_ok:
-            dropped_rows.append({"event_id": event.event_id, "reason": "incomplete_window"})
+            _drop(event, "incomplete_window", f"[{regression_window[0]}, {regression_window[1]}]")
             continue
         window_frame["car_path"] = np.nan
         if path_complete:
@@ -496,7 +512,8 @@ def estimate_events(
         kept = base.merge(pd.DataFrame(kept_rows), on="event_id", how="inner")
     else:
         kept = base.iloc[0:0].copy()
-    dropped = pd.DataFrame(dropped_rows, columns=["event_id", "reason"])
+    drop_columns = ["event_id", "code", "event_date", "firm_name", "reason", "failed_window"]
+    dropped = pd.DataFrame(dropped_rows, columns=drop_columns) if dropped_rows else pd.DataFrame(columns=drop_columns)
     long = pd.concat(panel_rows, ignore_index=True) if panel_rows else pd.DataFrame()
     return Estimation(panel=long, events=kept, dropped=dropped, calendar=calendar)
 
