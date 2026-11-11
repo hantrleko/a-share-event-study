@@ -84,6 +84,9 @@ def run_robustness(
         prices_frame=prices_frame,
         market_frame=market_frame,
     )
+    from ashare_event.reference import apply_builtin
+
+    filtered, industry_frame, factors_frame, _notes = apply_builtin(cfg, filtered, industry_frame, factors_frame)
     rows = []
     for spec in _specs(cfg):
         row = {
@@ -113,6 +116,7 @@ def run_robustness(
                 industry_frame=industry_frame if spec["model"] in {"industry", cfg.model} else None,
                 factors_frame=factors_frame if spec["model"] in {"ff3", "ff5", "carhart", cfg.model} else None,
                 market_lags=int(cfg.market_lags or 0) if spec["model"] == cfg.model else 0,
+                drop_event_day_limit=bool(cfg.drop_event_day_limit),
             )
         except (ValueError, KeyError) as exc:
             row["note"] = str(exc)

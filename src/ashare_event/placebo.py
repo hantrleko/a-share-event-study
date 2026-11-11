@@ -52,6 +52,9 @@ def _store(prices, market, industry_frame, factors_frame, factor_columns=None) -
             columns = list(factor_columns or ("mkt", "smb", "hml"))
             if all(column in aligned.columns for column in columns):
                 factors = aligned[columns].to_numpy(dtype=float)
+                if factor_columns and "rf" in aligned.columns:
+                    rf = aligned["rf"].to_numpy(dtype=float)
+                    firm = {code: np.asarray(series, dtype=float) - rf for code, series in firm.items()}
     return _Store(calendar=calendar, mkt=mkt.reindex(calendar).to_numpy(dtype=float), firm=firm, industry=industry, factors=factors)
 
 
@@ -60,6 +63,12 @@ def _codes(events: pd.DataFrame) -> np.ndarray:
 
 
 def _industries(events: pd.DataFrame) -> np.ndarray:
+    if "sw_l1" in events.columns:
+        labels = events["sw_l1"].astype(str)
+        if "industry" in events.columns:
+            fallback = events["industry"].astype(str)
+            labels = labels.where(~labels.isin(["", "nan", "None"]), fallback)
+        return labels.to_numpy()
     if "industry" not in events.columns:
         return np.array([""] * len(events), dtype=object)
     return events["industry"].astype(str).to_numpy()

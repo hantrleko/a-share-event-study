@@ -53,6 +53,7 @@ class StudyConfig:
     anticipation_window: tuple[int, int] | None = None
     winsorize: float = 0.0
     market_lags: int = 0
+    drop_event_day_limit: bool = False
 
     def resolve(self, rel: str) -> Path:
         path = Path(rel)
@@ -167,6 +168,7 @@ def load_config(path: str | Path, **overrides) -> StudyConfig:
         anticipation_window=_optional_pair(raw.get("anticipation_window", [-10, -6]), "anticipation_window"),
         winsorize=float(raw.get("winsorize", 0) or 0),
         market_lags=int(raw.get("market_lags", 0) or 0),
+        drop_event_day_limit=bool(raw.get("drop_event_day_limit", False)),
     )
     for key, value in overrides.items():
         if not hasattr(cfg, key):
@@ -209,6 +211,7 @@ _KNOWN = {
     "anticipation_window",
     "winsorize",
     "market_lags",
+    "drop_event_day_limit",
 }
 
 

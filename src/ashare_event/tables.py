@@ -446,6 +446,7 @@ DROP_LABELS = {
         "no_industry_benchmark": "没有这家公司的行业指数",
         "few_estimation_obs": "估计窗里的有效天数不够",
         "incomplete_window": "事件窗不完整",
+        "limit_day": "事件日涨跌停",
     },
     "en": {
         "loaded": "Events read",
@@ -457,6 +458,7 @@ DROP_LABELS = {
         "no_industry_benchmark": "No industry index for this firm",
         "few_estimation_obs": "Too few estimation observations",
         "incomplete_window": "Event window is incomplete",
+        "limit_day": "Limit hit on the event day",
     },
 }
 DROP_REASON_ORDER = (
@@ -466,6 +468,7 @@ DROP_REASON_ORDER = (
     "short_history",
     "few_estimation_obs",
     "no_industry_benchmark",
+    "limit_day",
     "incomplete_window",
 )
 

@@ -29,7 +29,19 @@ from ashare_event.bundle import build_zip
 from ashare_event.config import ConfigError, clone_config, load_config, validate_windows
 from ashare_event.labels import coef_label, event_type_label
 from ashare_event.market import read_factor_frame, read_industry_frame, read_price_frame
+from ashare_event.jobs import (
+    job_status,
+    job_zip_bytes,
+    load_job_context,
+    load_job_result,
+    rewrite_job_zip,
+    should_background,
+    submit_job,
+)
 from ashare_event.pipeline import run_study
+from ashare_event.reference import load_case_events, load_case_summary, locate_ch3
+from ashare_event.specs import persist_specs, spec_display, spec_row, spec_sentence, spec_table
+from ashare_event.text_import import events_from_filing_text, load_filing_events, locate_filing_panel, read_filing_table
 from ashare_event.robustness import run_robustness
 from ashare_event.schema import (
     FIELD_LABELS,
@@ -42,13 +54,16 @@ from ashare_event.schema import (
 from ashare_event.simulate import simulate
 from ashare_event.tables import stars as star_mark
 
+FILING_COVARIATES = ("signal_cost", "mda_esg_per_k", "mda_geopol_per_k")
 PRESET_VARIABLES = (
     ("signal_cost", "信号成本"),
     ("size_log", "对数规模"),
     ("legitimacy_gap", "合法性缺口"),
 )
 VARIABLE_HELP = {
-    "signal_cost": "信号成本。披露或行动越难模仿，这个数越高。若市场把它当成可信信号，它越高，累计异常收益越高。",
+    "signal_cost": "信号成本的代理。手填时按你的定义。从年报文本特征引擎导入时，这一列只是管理层讨论的数智化/AI 每千词，衡量披露用词强度，不是已经测得的信号成本。系数是相关。",
+    "mda_esg_per_k": "年报文本特征引擎里，管理层讨论的绿色/ESG 每千词。这是用词强度，不是 ESG 表现，也不写入合法性缺口。",
+    "mda_geopol_per_k": "年报文本特征引擎里，管理层讨论的地缘用词每千词。这是用词强度，不是已经识别的地缘冲击。",
     "size_log": "公司规模的对数。通常只作控制变量，本身不是一条机制。",
     "legitimacy_gap": "合法性缺口。事件前的信任或争议越大，这个数越高。负面事件上，它越高，累计异常收益越低。",
 }
@@ -238,6 +253,174 @@ def _discard_run_dir(item: dict) -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
+def _recorded_groups(selected, frame, column: str):
+    if selected is None:
+        return None
+    chosen = [str(value) for value in selected if str(value).strip()]
+    if frame is None or column not in getattr(frame, "columns", []):
+        return chosen or None
+    levels = {str(value) for value in frame[column].dropna().astype(str) if str(value).strip()}
+    if not chosen or set(chosen) == levels:
+        return None
+    return chosen
+
+
+def _attach_session_spec(result, *, source: str, industries, event_types) -> None:
+    row = spec_row(result, source=source, industries=industries, event_types=event_types)
+    log = list(st.session_state.get("spec_log") or [])
+    log.append(row)
+    if len(log) > 50:
+        log = log[-50:]
+    st.session_state.spec_log = log
+    result.specs = spec_table(log)
+    persist_specs(result)
+
+
+def _job_id() -> str:
+    raw = st.query_params.get("job", "")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    text = str(raw or "").strip()
+    if re.fullmatch(r"[0-9a-f]{8,32}", text):
+        return text
+    stored = str(st.session_state.get("active_job") or "").strip()
+    if re.fullmatch(r"[0-9a-f]{8,32}", stored):
+        return stored
+    return ""
+
+
+def _load_finished_job() -> None:
+    job_id = _job_id()
+    if not job_id:
+        return
+    status = job_status(job_id, ROOT)
+    if status.get("state") != "complete":
+        return
+    if st.session_state.get("loaded_job") == job_id and st.session_state.get("study_result") is not None:
+        return
+    result = load_job_result(job_id, ROOT)
+    if result is None:
+        return
+    context = load_job_context(job_id, ROOT) or {}
+    source = context.get("source") or status.get("source") or "后台"
+    raw_window = context.get("window") or status.get("car_window") or result.config.regression_window
+    window = tuple(int(item) for item in raw_window)
+    _attach_session_spec(
+        result,
+        source=source,
+        industries=context.get("industries"),
+        event_types=context.get("event_types"),
+    )
+    try:
+        rewrite_job_zip(job_id, result, ROOT)
+    except Exception:
+        pass
+    st.session_state.study_result = result
+    st.session_state.study_window = window
+    st.session_state.study_source = source
+    st.session_state.loaded_job = job_id
+    inputs = context.get("inputs")
+    if isinstance(inputs, dict):
+        _remember_run(result, source, window, inputs)
+
+
+def _job_needs_page(busy: bool) -> bool:
+    if busy:
+        return False
+    job_id = _job_id()
+    if not job_id:
+        return False
+    status = job_status(job_id, ROOT)
+    state = status.get("state")
+    if state == "running":
+        done = int(status.get("done") or 0)
+        total = int(status.get("total") or 0)
+        label = str(status.get("label") or "计算中")
+        fraction = min(done / total, 1.0) if total else 0.0
+        st.progress(fraction, text=f"{label}（{done}/{total}）" if total else label)
+        st.caption(f"任务 {job_id} 在后台计算。把地址栏链接留下，算完后打开同一链接。点「查看进度」读最新状态，页面不会自动刷新。")
+        if st.button("查看进度", key="job_refresh"):
+            st.rerun()
+        return True
+    if state == "error":
+        st.error(str(status.get("message") or "这次没有算完。"))
+        return True
+    if state == "lost":
+        st.warning(str(status.get("message") or "后台线程不在了。请重新运行。"))
+        return True
+    if state == "complete" and st.session_state.get("study_result") is None:
+        _show_job_summary(job_id, status)
+        return True
+    if state == "missing" and st.query_params.get("job"):
+        st.caption("地址栏里的任务编号没有对应的结果。后台目录在重新部署后会清空。")
+    return False
+
+
+def _show_job_summary(job_id: str, status: dict) -> None:
+    mean = status.get("mean_car_pp")
+    mean_text = "—" if mean is None else f"{float(mean):.3f}"
+    t_value = status.get("t_preferred")
+    t_text = "—" if t_value is None else f"{float(t_value):.2f}"
+    st.caption(
+        f"任务 {job_id} 已完成。N={status.get('n', '—')}，平均 CAR {mean_text} 个百分点，"
+        f"首选 {status.get('preferred') or '—'}，t={t_text}。"
+    )
+    if status.get("simulated"):
+        st.warning("这次是模拟样本。下面的数字不能当作实证结果。")
+    payload = job_zip_bytes(job_id, ROOT)
+    if payload:
+        st.download_button(
+            "下载这次后台结果",
+            data=payload,
+            file_name=f"event_study_{job_id}.zip",
+            mime="application/zip",
+            key=f"job-zip-{job_id}",
+        )
+    else:
+        st.caption("结果压缩包还没有写出来。")
+
+
+def _start_background_job(cfg, run_kwargs, inputs, source: str, window, industries, event_types) -> str:
+    cfg_job = clone_config(cfg)
+    kwargs_job = dict(run_kwargs)
+    for key in ("events_frame", "prices_frame", "market_frame", "industry_frame", "factors_frame"):
+        kwargs_job[key] = _copy_frame(run_kwargs.get(key))
+    labels = {
+        "inputs": "读取事件和行情",
+        "estimate": "估计窗与事件窗",
+        "tests": "窗口检验与路径",
+        "placebo": "安慰剂",
+        "export": "回归表与导出",
+    }
+
+    def worker(progress):
+        def on_download(done, total, symbol, from_cache):
+            verb = "读取缓存" if from_cache else "下载"
+            progress(done, total, f"{verb} {symbol}")
+
+        def on_step(key):
+            progress(None, None, labels.get(key, key))
+
+        return run_study(cfg_job, on_step=on_step, on_download=on_download, **kwargs_job)
+
+    return submit_job(
+        worker,
+        base=ROOT,
+        meta={
+            "source": source,
+            "model": cfg_job.model,
+            "car_window": [int(window[0]), int(window[1])],
+        },
+        context={
+            "inputs": inputs,
+            "source": source,
+            "window": [int(window[0]), int(window[1])],
+            "industries": industries,
+            "event_types": event_types,
+        },
+    )
+
+
 def _remember_run(result, source: str, window, inputs: dict) -> None:
     _release_panel(result)
     history = st.session_state.setdefault("run_history", [])
@@ -367,7 +550,31 @@ def _import_csv(upload) -> None:
     renamed["event_date"] = pd.to_datetime(renamed["event_date"], errors="coerce")
     st.session_state.custom_vars = extras
     st.session_state.event_grid = _align_grid(renamed, extras)
+    st.session_state.text_import_note = ""
+    st.session_state.text_signal_source = ""
     _reset_editor()
+
+
+def _remember_filing_frame(events: pd.DataFrame, path: str) -> None:
+    st.session_state.filing_upload_events = events
+    st.session_state.filing_upload_path = path
+    st.session_state.text_import_note = str(events.attrs.get("import_note") or "")
+    st.session_state.text_signal_source = str(events.attrs.get("signal_source") or "")
+
+
+def _cached_filing_events():
+    """Read the text engine's export once per file version. The file stays where it is."""
+    path = locate_filing_panel()
+    if path is None:
+        return None, None
+    token = f"{path}:{path.stat().st_mtime_ns}:{path.stat().st_size}"
+    cached = st.session_state.get("filing_events")
+    if st.session_state.get("filing_token") == token and isinstance(cached, pd.DataFrame):
+        return path, cached
+    events = load_filing_events(path)
+    st.session_state.filing_token = token
+    st.session_state.filing_events = events
+    return path, events
 
 
 def _usable_events(frame: pd.DataFrame) -> pd.DataFrame | None:
@@ -448,8 +655,9 @@ def _show_guide() -> None:
                     "- **路径窗**：图的横轴。每个点是从路径起点一直加到当天的平均累计异常收益。",
                     "- **市场模型**：先在估计窗里拟合「个股收益 = 截距 + 斜率 × 指数收益」，事件窗里减不掉的部分就是异常收益。",
                     "- **市场调整**：不估计截距和斜率，直接用个股收益减指数收益。",
-                    "- **行业基准 / 因子模型**：指数或因子文件由你上传。五因子需要 rmw 和 cma，Carhart 需要 umd。程序不下载申万行业，也不生成因子收益。交易日仍按宽基指数的日历对齐。",
+                    "- **行业基准 / 因子模型**：不上传时，行业基准用申万一级，三因子用本机 CH3 日频（市场超额、SMB、VMG）。五因子需要 rmw 和 cma，Carhart 需要 umd，这两项仍要上传。交易日仍按宽基指数的日历对齐。",
                     "- **盘后**：表里的勾选列。勾上后从公告日的下一个交易日起对齐。CSV 里写成「盘后」或 1 也行，它不会被当成回归变量。",
+                    "- **年报词频**：左侧单独一项。直接读年报文本特征引擎已经导出的因子表，不复制年报正文。管理层讨论的数智化/AI 每千词写入 signal_cost；绿色/ESG 和地缘每千词各自留列。缺测不记成 0。",
                     "- **前复权**：分红送股之后价格仍能前后比较，算收益率时用这个。",
                 ]
             )
@@ -468,6 +676,8 @@ def _show_guide() -> None:
                     "- **安慰剂图**：伪事件日上会重新拟合估计窗。柱是那些伪日期的平均累计异常收益，竖线是真实日期。这不是对照组。",
                     "- **候选机制**：估计前的三条读法，用来设计变量。它不是已经证实的结论。",
                     "- **tex 文件**：给论文直接引入。演示样本和模拟试跑的数字不能写入论文。",
+                    "- **规格登记**：每次跑完记下窗口、模型和分组。导出里有「共试了 N 种规格」。星号不按这 N 次再校正。",
+                    "- **后台任务**：事件很多且要下载行情时，计算放在后台。地址栏里的任务链接用来取回结果，页面不会自动刷新。",
                 ]
             )
         )
@@ -481,7 +691,14 @@ with st.sidebar:
     st.image(str(LOGO), width=148)
     st.caption("EF Lab · [eugenefinance.tech](https://eugenefinance.tech)")
     st.header("事件")
-    source = st.radio("事件从哪来", ["演示样本", "我的事件表"], key="event_source")
+    source = st.radio("事件从哪来", ["对照案例", "年报词频", "演示样本", "我的事件表"], key="event_source")
+    seen = st.session_state.get("source_seen")
+    if seen is not None and seen != source:
+        st.session_state.study_result = None
+        st.session_state.active_job = None
+        if "job" in st.query_params:
+            del st.query_params["job"]
+    st.session_state.source_seen = source
     import_error = ""
     if source == "我的事件表":
         st.caption("标准列：code, event_date, event_type, industry, firm_name, after_close。示例：`002230,2023-07-13,ai_policy,软件,科大讯飞`。盘后列勾选即可，不必写成回归变量。")
@@ -529,13 +746,92 @@ with st.sidebar:
                     import_error = str(exc)
                     st.session_state.imported_token = token
                     st.error(import_error)
-    else:
+    elif source == "年报词频":
+        st.caption(
+            "这条链直接读年报文本特征引擎已经导出的因子表：披露用词 → 公告日 → 这里的累计异常收益。"
+            "词频不在这里重算，年报正文也不复制进本项目。"
+        )
+        filing_path, filing_events = None, None
+        try:
+            filing_path, filing_events = _cached_filing_events()
+        except (ValueError, OSError) as exc:
+            import_error = str(exc)
+            st.error(import_error)
+            filing_path = locate_filing_panel()
+        text_upload = st.file_uploader(
+            "改用另一份引擎导出",
+            type=["csv", "parquet", "dta"],
+            key="text_panel",
+            help="默认用本机已经导出的 panel_factor。只有要换一份时才上传。",
+        )
+        if text_upload is not None:
+            text_token = f"text:{text_upload.name}:{text_upload.size}"
+            if st.session_state.get("text_import_token") != text_token:
+                st.session_state.filing_ignore_upload = False
+                try:
+                    uploaded = events_from_filing_text(read_filing_table(text_upload, name=getattr(text_upload, "name", "")))
+                    _remember_filing_frame(uploaded, text_upload.name)
+                    st.session_state.text_import_token = text_token
+                    st.rerun()
+                except (SchemaError, ValueError, OSError) as exc:
+                    import_error = str(exc)
+                    st.session_state.text_import_token = text_token
+                    st.error(import_error)
+        if isinstance(st.session_state.get("filing_upload_events"), pd.DataFrame) and not st.session_state.get("filing_ignore_upload"):
+            filing_events = st.session_state.filing_upload_events
+            filing_path = None
+            st.caption(f"当前用的是上传文件 {st.session_state.get('filing_upload_path') or ''}，不是本机导出目录。")
+            if st.button("改回本机导出", key="filing-reset"):
+                st.session_state.filing_ignore_upload = True
+                st.session_state.filing_upload_events = None
+                st.rerun()
+        elif filing_path is not None and filing_events is None:
+            st.caption(f"读到 {filing_path}，但这份表没有接上公告日，所以还没有变成事件。")
+        elif filing_path is not None:
+            st.caption(f"读到 {filing_path}")
+            st.session_state.text_import_note = str(filing_events.attrs.get("import_note") or "") if filing_events is not None else ""
+            st.session_state.text_signal_source = str(filing_events.attrs.get("signal_source") or "") if filing_events is not None else ""
+        else:
+            st.caption(
+                "还没有找到因子表。设置 ASHARE_FILING_TEXT_DIR，"
+                "或先在年报文本特征引擎里导出 panel_factor，"
+                "默认位置是 F:\\listed-filing-textmine\\data\\factor_panel\\output。"
+            )
+        if filing_events is not None and "fiscal_year" in filing_events.columns:
+            years = sorted({int(year) for year in pd.to_numeric(filing_events["fiscal_year"], errors="coerce").dropna().tolist()})
+            if years:
+                chosen_years = st.multiselect(
+                    "报告期",
+                    [str(year) for year in years],
+                    default=[str(year) for year in years],
+                    key="filing-years",
+                )
+                keep_years = {int(year) for year in chosen_years}
+                if keep_years != set(years):
+                    note = str(filing_events.attrs.get("import_note") or "")
+                    signal = str(filing_events.attrs.get("signal_source") or "")
+                    year_num = pd.to_numeric(filing_events["fiscal_year"], errors="coerce")
+                    filing_events = filing_events.loc[year_num.round().isin(keep_years)].copy()
+                    filing_events.attrs["import_note"] = note
+                    filing_events.attrs["signal_source"] = signal
+        if filing_events is not None and len(filing_events) == 0:
+            filing_events = None
+        st.session_state.filing_active = filing_events
+        if st.session_state.get("text_import_note"):
+            st.caption(st.session_state.text_import_note)
+    elif source == "演示样本":
         st.caption("演示样本只用来看流程，数字不能写入论文。")
 
     audit_report = pd.DataFrame(columns=["行号", "代码", "级别", "问题"])
     audit_error_count = 0
     if source == "演示样本":
         event_ready = _demo_events(config_path)
+    elif source == "对照案例":
+        event_ready = load_case_events()
+    elif source == "年报词频":
+        event_ready = st.session_state.get("filing_active")
+        if not isinstance(event_ready, pd.DataFrame):
+            event_ready = None
     else:
         audit_report = audit_grid(st.session_state.event_grid)
         audit_error_count = int((audit_report["级别"] == "错误").sum()) if len(audit_report) else 0
@@ -548,76 +844,30 @@ with st.sidebar:
                 st.error(import_error)
     st.session_state.audit_report = audit_report
 
-    st.header("样本")
-    industries: list[str] | None = None
-    event_types: list[str] | None = None
-    if event_ready is not None:
-        type_levels = _levels(event_ready, "event_type")
-        industry_levels = _levels(event_ready, "industry")
-        token = "demo" if source == "演示样本" else "own"
-        if type_levels:
-            event_types = st.multiselect(
-                "事件类型",
-                type_levels,
-                default=type_levels,
-                format_func=lambda item: event_type_label(base.language, item),
-                key=f"types-{token}",
-                help="只保留打了这些标签的行。标签是你在事件表里写的，不是行情软件的分类。",
-            )
-        else:
-            st.caption("事件类型还是空的，填进表里之后会在这里列出。")
-        if industry_levels:
-            industries = st.multiselect(
-                "行业",
-                industry_levels,
-                default=industry_levels,
-                key=f"ind-{token}",
-                help="只保留这些行业。行业固定效应也只用留在样本里的行业。",
-            )
-        else:
-            st.caption("行业还是空的。")
-        if source == "我的事件表":
-            drop_overlap = st.checkbox(
-                "同一公司事件相距不超过 CAR 窗时，只留较早一件",
-                value=False,
-                key="drop_overlap",
-                help="默认不删。每条公司-事件等权进入平均 CAR，同一公司的多起事件在回归里按公司聚类。勾选后，用日历日近似去掉靠得太近的后一件。",
-            )
-        else:
-            drop_overlap = False
-    else:
-        drop_overlap = False
-        st.caption("先在标准表里写上代码和日期。")
-
-    st.header("行情")
     if source == "演示样本":
         price_mode = "demo"
-        st.caption("演示样本使用内置行情。")
+    elif source == "对照案例":
+        price_mode = "akshare"
+        st.caption("对照案例用 AKShare 前复权。基准指数和复权在「进阶」，默认沪深300、前复权。")
+    elif source == "年报词频":
+        st.header("行情")
+        price_choice = st.radio("价格从哪来", ["AKShare", "本地文件"], key="filing_price_mode")
+        price_mode = "akshare" if price_choice == "AKShare" else "local"
+        if price_mode == "akshare":
+            st.caption("事件日来自年报公告。基准指数和复权在「进阶」，默认沪深300、前复权。公司很多时会放到后台。")
     else:
+        st.header("行情")
         price_choice = st.radio("价格从哪来", ["AKShare", "本地文件"], key="price_mode")
         price_mode = "akshare" if price_choice == "AKShare" else "local"
+        if price_mode == "akshare":
+            st.caption("基准指数和复权在下面的「进阶」里。默认沪深300、前复权。")
     benchmark = base.benchmark
     adjust = base.adjust
     prices_frame = None
     market_frame = None
     industry_frame = None
     factors_frame = None
-    if price_mode == "akshare":
-        benchmark = st.text_input(
-            "基准指数",
-            value=base.benchmark,
-            key="benchmark",
-            help="市场收益用哪条指数。000300 是沪深300。个股异常收益是相对这条指数算的。",
-        ).strip() or base.benchmark
-        adjust_label = st.selectbox(
-            "复权",
-            ["前复权", "后复权", "不复权"],
-            key="adjust",
-            help="前复权让分红送股前后的价格能比较，算收益率时用它。不复权会在除权日出现假的大跌。",
-        )
-        adjust = {"前复权": "qfq", "后复权": "hfq", "不复权": ""}[adjust_label]
-        st.caption("交易日按这条宽基指数的日历对齐。行业基准和三因子另传文件，不会替换这条日历。非交易日的事件日向后顺延，最多 10 个日历日。默认前复权，避免除权日造出假的大跌。")
-    elif price_mode == "local":
+    if price_mode == "local":
         price_file = st.file_uploader("个股行情 CSV（代码、日期、收盘）", type=["csv"], key="prices_csv")
         market_file = st.file_uploader("指数行情 CSV（日期、收盘）", type=["csv"], key="market_csv")
         if price_file is not None:
@@ -669,7 +919,7 @@ with st.sidebar:
         ["market", "market_adjusted", "industry", "ff3", "ff5", "carhart"],
         format_func=lambda item: MODEL_LABELS[item],
         key="return_model",
-        help="市场模型为每家公司估计自己的截距和斜率。市场调整则假定斜率是 1、截距是 0。行业基准和因子模型使用你上传的文件。",
+        help="市场模型为每家公司估计自己的截距和斜率。市场调整则假定斜率是 1、截距是 0。不上传文件时，行业基准用申万一级，三因子用本机的 CH3 日频。五因子和 Carhart 仍要上传。",
     )
     factor_needs = {
         "ff3": ("mkt", "smb", "hml"),
@@ -678,7 +928,7 @@ with st.sidebar:
     }
     if model == "industry":
         industry_file = st.file_uploader("行业指数 CSV（行业、日期、收盘）", type=["csv"], key="industry_csv")
-        st.caption("同一行业每天一行收盘价。程序用它替换市场收益，仍用上面的宽基指数决定交易日。不会自动匹配申万行业。")
+        st.caption("留空则用申万一级：按分类历史匹配事件日当天的一级行业，并下载对应指数。上传文件会代替这份内置指数。交易日仍用宽基指数。")
         if industry_file is not None:
             try:
                 industry_frame = read_industry_frame(pd.read_csv(industry_file))
@@ -690,7 +940,10 @@ with st.sidebar:
             type=["csv"],
             key="factor_csv",
         )
-        st.caption("因子收益由你提供，程序不下载。日期要能对上宽基指数的交易日。")
+        if model == "ff3":
+            st.caption("留空则用 Liu-Stambaugh-Yuan CH3 日频：市场超额收益、SMB、VMG。VMG 不是 Fama-French 的 HML。上传文件会代替它。")
+        else:
+            st.caption("五因子需要 rmw、cma，Carhart 需要 umd。CH3 日频库里没有这两列，所以这里必须上传。")
         if factor_file is not None:
             try:
                 factors_frame = read_factor_frame(pd.read_csv(factor_file))
@@ -700,73 +953,146 @@ with st.sidebar:
                     st.error("因子文件还缺：" + "、".join(missing_factors))
             except Exception as exc:
                 st.error(str(exc))
-    covariate_source = event_ready if event_ready is not None else st.session_state.event_grid
-    covariate_options = _numeric_columns(covariate_source, st.session_state.custom_vars) if source == "我的事件表" else []
-    if source == "演示样本" and event_ready is not None:
-        covariate_options = [column for column in ("signal_cost", "size_log", "legitimacy_gap") if column in event_ready.columns]
-    covariates = []
-    if covariate_options:
-        covariates = st.multiselect(
-            "放进回归的变量",
-            covariate_options,
-            default=covariate_options,
-            key=f"cov-{source}",
-            help="勾选的数值列用来解释公司之间 CAR 的差别。系数单位是百分点。这是相关，不是因果。",
+
+    industries: list[str] | None = None
+    event_types: list[str] | None = None
+    drop_overlap = False
+    with st.expander("进阶", expanded=False):
+        st.caption("样本筛选、基准指数、复权和推断。这里的默认值会直接用于运行。")
+        if event_ready is not None:
+            type_levels = _levels(event_ready, "event_type")
+            industry_levels = _levels(event_ready, "industry")
+            token = {"演示样本": "demo", "年报词频": "filing"}.get(source, "own")
+            if type_levels:
+                event_types = st.multiselect(
+                    "事件类型",
+                    type_levels,
+                    default=type_levels,
+                    format_func=lambda item: event_type_label(base.language, item),
+                    key=f"types-{token}",
+                    help="只保留打了这些标签的行。标签是你在事件表里写的，不是行情软件的分类。",
+                )
+            else:
+                st.caption("事件类型还是空的，填进表里之后会在这里列出。")
+            if industry_levels:
+                industries = st.multiselect(
+                    "行业",
+                    industry_levels,
+                    default=industry_levels,
+                    key=f"ind-{token}",
+                    help="只保留这些行业。行业固定效应也只用留在样本里的行业。",
+                )
+            else:
+                st.caption("行业还是空的。")
+            if source in {"我的事件表", "年报词频"}:
+                drop_overlap = st.checkbox(
+                    "同一公司事件相距不超过 CAR 窗时，只留较早一件",
+                    value=False,
+                    key="drop_overlap",
+                    help="默认不删。每条公司-事件等权进入平均 CAR，同一公司的多起事件在回归里按公司聚类。勾选后，用日历日近似去掉靠得太近的后一件。",
+                )
+        else:
+            st.caption("先在标准表里写上代码和日期。")
+        if price_mode == "akshare":
+            benchmark = st.text_input(
+                "基准指数",
+                value=base.benchmark,
+                key="benchmark",
+                help="市场收益用哪条指数。000300 是沪深300。个股异常收益是相对这条指数算的。",
+            ).strip() or base.benchmark
+            adjust_label = st.selectbox(
+                "复权",
+                ["前复权", "后复权", "不复权"],
+                key="adjust",
+                help="前复权让分红送股前后的价格能比较，算收益率时用它。不复权会在除权日出现假的大跌。",
+            )
+            adjust = {"前复权": "qfq", "后复权": "hfq", "不复权": ""}[adjust_label]
+            st.caption("交易日按这条宽基指数的日历对齐。行业基准和三因子另传文件，不会替换这条日历。非交易日的事件日向后顺延，最多 10 个日历日。默认前复权，避免除权日造出假的大跌。")
+        covariate_source = event_ready if event_ready is not None else st.session_state.event_grid
+        covariate_options = _numeric_columns(covariate_source, st.session_state.custom_vars) if source == "我的事件表" else []
+        if source == "演示样本" and event_ready is not None:
+            covariate_options = [column for column in ("signal_cost", "size_log", "legitimacy_gap") if column in event_ready.columns]
+        if source == "年报词频" and event_ready is not None:
+            covariate_options = [
+                column
+                for column in FILING_COVARIATES
+                if column in event_ready.columns and pd.to_numeric(event_ready[column], errors="coerce").notna().any()
+            ]
+        covariates = []
+        if covariate_options:
+            covariates = st.multiselect(
+                "放进回归的变量",
+                covariate_options,
+                default=covariate_options,
+                key=f"cov-{source}",
+                help="勾选的数值列用来解释公司之间 CAR 的差别。系数单位是百分点。这是相关，不是因果。",
+            )
+        elif source == "我的事件表":
+            st.caption("数值变量要在表里有不同取值，才会出现在这里。")
+        include_peer = st.checkbox(
+            "加入同业事件数（内生，默认别当识别）",
+            value=False,
+            key="peer",
+            help="同一行业、前后 5 个日历日内还有多少别的样本事件。它由样本自己数出来，不能单独当成因果识别。",
         )
-    elif source == "我的事件表":
-        st.caption("数值变量要在表里有不同取值，才会出现在这里。")
-    include_peer = st.checkbox(
-        "加入同业事件数（内生，默认别当识别）",
-        value=False,
-        key="peer",
-        help="同一行业、前后 5 个日历日内还有多少别的样本事件。它由样本自己数出来，不能单独当成因果识别。",
-    )
-    do_placebo = st.checkbox(
-        "做安慰剂",
-        value=False,
-        key="placebo",
-        help="把事件日挪到估计窗之前的其他交易日，并在伪日期上重新拟合估计窗。用来看真实日期是否突出。这不是对照组。",
-    )
-    placebo_draws = int(
-        st.number_input(
-            "安慰剂次数",
-            min_value=0,
-            max_value=500,
-            value=50,
-            step=10,
-            key="draws",
-            help="挪动并重算的次数。次数越多，p 值越细，等待也越久。",
+        do_placebo = st.checkbox(
+            "做安慰剂",
+            value=False,
+            key="placebo",
+            help="把事件日挪到估计窗之前的其他交易日，并在伪日期上重新拟合估计窗。用来看真实日期是否突出。这不是对照组。",
         )
-    )
-    wild_draws = int(
-        st.number_input(
-            "wild bootstrap 次数",
-            min_value=0,
-            max_value=999,
-            value=0,
-            step=49,
-            key="wild",
-            help="只对不含固定效应的回归另算 wild cluster bootstrap p。0 表示不计算。命令行配置里是 199。次数多时网页会等很久。星号仍来自聚类标准误。",
+        placebo_draws = int(
+            st.number_input(
+                "安慰剂次数",
+                min_value=0,
+                max_value=500,
+                value=50,
+                step=10,
+                key="draws",
+                help="挪动并重算的次数。次数越多，p 值越细，等待也越久。",
+            )
         )
-    )
-    do_winsor = st.checkbox(
-        "横截面 CAR 上下 1% 缩尾",
-        value=False,
-        key="winsor",
-        help="默认关闭。打开后只缩 CAR 和 BHAR，不缩路径。至少 8 个事件才缩。安慰剂仍对照缩尾前的平均 CAR。",
-    )
-    do_lags = st.checkbox(
-        "估计窗加入市场前后一日",
-        value=False,
-        key="lags",
-        help="默认关闭。三个斜率相加。事件窗预测只用当天的市场收益。市场调整模型会忽略这项。",
-    )
-    do_anticipation = st.checkbox(
-        "报告预事件窗口 [-10, -6]",
-        value=True,
-        key="anticipation",
-        help="单独列出，不进入 BH，也不因此删事件。它必须落在估计窗右边、事件日之前。",
-    )
+        wild_draws = int(
+            st.number_input(
+                "wild bootstrap 次数",
+                min_value=0,
+                max_value=999,
+                value=0,
+                step=49,
+                key="wild",
+                help="只对不含固定效应的回归另算 wild cluster bootstrap p。0 表示不计算。命令行配置里是 199。次数多时网页会等很久。星号仍来自聚类标准误。",
+            )
+        )
+        do_winsor = st.checkbox(
+            "横截面 CAR 上下 1% 缩尾",
+            value=False,
+            key="winsor",
+            help="默认关闭。打开后只缩 CAR 和 BHAR，不缩路径。至少 8 个事件才缩。安慰剂仍对照缩尾前的平均 CAR。",
+        )
+        do_lags = st.checkbox(
+            "估计窗加入市场前后一日",
+            value=False,
+            key="lags",
+            help="默认关闭。三个斜率相加。事件窗预测只用当天的市场收益。市场调整模型会忽略这项。",
+        )
+        do_anticipation = st.checkbox(
+            "报告预事件窗口 [-10, -6]",
+            value=True,
+            key="anticipation",
+            help="单独列出，不进入 BH，也不因此删事件。它必须落在估计窗右边、事件日之前。",
+        )
+        drop_limit = st.checkbox(
+            "剔除事件日涨跌停",
+            value=False,
+            key="drop_limit",
+            help="从 CAR 样本里去掉事件日涨停或跌停的公司。有交易所名单时用名单；涨停池不含 ST 和科创板，跌停池只覆盖近 30 日。名单没有覆盖到的，用板块带宽。默认不删。",
+        )
+        background_run = st.checkbox(
+            "这次放后台",
+            value=False,
+            key="background_run",
+            help="页面可以离开。算完后用地址栏里的任务链接取回压缩包。事件达到 30 条且要下载行情时，不勾也会自动放后台。演示样本默认仍在页面里算完。",
+        )
 
     window_error = None
     if estimation[0] > estimation[1] or path_window[0] > path_window[1] or car_window[0] > car_window[1]:
@@ -790,19 +1116,24 @@ with st.sidebar:
             st.error(window_error)
 
     missing = []
-    example_blocked = source == "我的事件表" and _has_example_name(event_ready)
+    example_blocked = source in {"我的事件表", "年报词频"} and _has_example_name(event_ready)
+    ch3_ready = locate_ch3() is not None
     benchmark_blocked = source == "演示样本" and model in {"industry", "ff3", "ff5", "carhart"}
     if source == "我的事件表" and event_ready is None:
         missing.append("事件表")
+    if source == "年报词频" and event_ready is None:
+        missing.append("年报词频")
     if example_blocked:
         missing.append("示例行")
     if audit_error_count and not example_blocked:
         missing.append("体检")
     if benchmark_blocked:
         missing.append("基准")
-    if model == "industry" and industry_frame is None:
+    if model == "industry" and industry_frame is None and source == "演示样本":
         missing.append("行业指数")
-    if model in {"ff3", "ff5", "carhart"} and factors_frame is None:
+    if model == "ff3" and factors_frame is None and (source == "演示样本" or not ch3_ready):
+        missing.append("因子")
+    if model in {"ff5", "carhart"} and factors_frame is None:
         missing.append("因子")
     if price_mode == "local" and (prices_frame is None or market_frame is None):
         missing.append("本地行情")
@@ -811,33 +1142,52 @@ with st.sidebar:
     block_reason = ""
     if source == "我的事件表" and event_ready is None:
         block_reason = "还不能运行：至少填一行证券代码和事件日期。"
+    elif source == "年报词频" and event_ready is None:
+        block_reason = "还不能运行：没有读到年报文本特征引擎的因子表。"
+    elif example_blocked and source == "年报词频":
+        block_reason = "还不能运行：公司名里还有「示例」。这不是可以下载行情的真实公告。"
     elif example_blocked:
         block_reason = "还不能运行：公司名里还有「示例」。这是政策日示例，不是公司公告。核对后删掉这两个字。"
     elif audit_error_count:
         block_reason = f"数据体检有 {audit_error_count} 条错误。改正之后才能运行。警告和周末提示不会删行。"
     elif benchmark_blocked:
         block_reason = "演示样本只有市场基准。行业指数和因子模型要换成自己的事件表，并上传对应文件。"
-    elif model == "industry" and industry_frame is None:
-        block_reason = "还不能运行：行业基准需要上传行业、日期、收盘。程序不会自动匹配申万指数。"
-    elif model in {"ff3", "ff5", "carhart"} and factors_frame is None:
-        needed = "、".join({"ff3": ("mkt", "smb", "hml"), "ff5": ("mkt", "smb", "hml", "rmw", "cma"), "carhart": ("mkt", "smb", "hml", "umd")}[model])
-        block_reason = f"还不能运行：因子文件需要日期、{needed}。程序不生成因子收益。"
+    elif model == "ff3" and factors_frame is None and not ch3_ready:
+        block_reason = "还不能运行：没有找到 CH3 日频文件。可设置 ASHARE_CH_FACTOR_DIR，或改上传 mkt、smb、hml。"
+    elif model in {"ff5", "carhart"} and factors_frame is None:
+        needed = "、".join({"ff5": ("mkt", "smb", "hml", "rmw", "cma"), "carhart": ("mkt", "smb", "hml", "umd")}[model])
+        block_reason = f"还不能运行：因子文件需要日期、{needed}。CH3 日频库没有这些列。"
     elif price_mode == "local" and (prices_frame is None or market_frame is None):
         block_reason = "还不能运行：本地行情要同时上传个股和指数文件。行业基准和因子模型也仍要这条日历。"
     elif window_error or import_error:
         block_reason = window_error or import_error or "窗口或事件表还有问题。"
+    n_for_job = 0 if event_ready is None else len(event_ready)
+    use_background = should_background(
+        n_events=n_for_job,
+        mode=price_mode,
+        source=source,
+        forced=bool(background_run),
+    )
     run = st.button(
         "运行并导出",
         type="primary",
         disabled=bool(missing),
         help=block_reason or "按左侧设定计算累计异常收益、路径和回归。",
     )
+    if use_background and not background_run:
+        st.caption(
+            f"这次有 {n_for_job} 条事件，并且要下载行情。计算会放在后台，页面可以离开。完成后用地址栏里的任务链接取回。"
+        )
+    elif background_run:
+        st.caption("这次会放在后台。开始后地址栏会带上任务编号，算完再打开同一链接。")
     if block_reason:
         st.caption(block_reason)
     if source == "我的事件表" and st.button("清空事件表", key="clear_grid"):
         st.session_state.custom_vars = []
         st.session_state.event_grid = _blank_grid([])
         st.session_state.var_error = ""
+        st.session_state.text_import_note = ""
+        st.session_state.text_signal_source = ""
         _reset_editor()
         st.rerun()
 
@@ -881,12 +1231,62 @@ with st.expander("先看懂", expanded=False):
     )
 
 if source == "演示样本":
-    st.info("演示样本用来看流程。换成自己的研究时，在左侧切到「我的事件表」。")
+    st.info("演示样本用来看流程。数字来自模拟路径。对照真实日期时，切到「对照案例」。")
+elif source == "对照案例":
+    st.info(
+        "这四家公司的日期都是 2023-07-13，当天发布的是《生成式人工智能服务管理暂行办法》。"
+        "这不是各公司自己的公告。事件扎在同一天，首选检验会改用组合时间序列。这里的数字用来对照程序，不是论文结论。"
+    )
+    shown_case = event_ready.loc[:, ["code", "event_date", "firm_name", "industry", "event_type"]].copy()
+    shown_case["event_date"] = pd.to_datetime(shown_case["event_date"]).dt.strftime("%Y-%m-%d")
+    st.dataframe(shown_case, hide_index=True, **_stretch(st.dataframe))
+    saved_case = load_case_summary()
+    if saved_case:
+        st.caption(
+            f"已保存的一次运行：N={int(saved_case['n'])}，"
+            f"平均 CAR {float(saved_case['mean_car_pp']):.3f} 个百分点，"
+            f"首选 {saved_case['preferred']}，t={float(saved_case['t_preferred']):.2f}。"
+            f" {saved_case.get('note', '')}"
+        )
+    else:
+        st.caption("还没有保存过这次对照运行的摘要。点「运行并导出」后，结果出现在下面。")
+elif source == "年报词频":
+    if event_ready is None:
+        st.info("年报词频还没有接到事件表。左侧会说明因子表在哪里，也可以改传一份同一引擎的导出。")
+    else:
+        st.info(
+            "披露用词来自年报文本特征引擎，事件日按该引擎的公告日和可用日对齐，累计异常收益在这里计算。"
+            "数智化/AI、绿色/ESG、地缘是披露强度，不是已经识别的机制。"
+        )
+        show_cols = [
+            column
+            for column in (
+                "code",
+                "firm_name",
+                "event_date",
+                "after_close",
+                "fiscal_year",
+                "signal_cost",
+                "mda_esg_per_k",
+                "mda_geopol_per_k",
+            )
+            if column in event_ready.columns
+        ]
+        preview = event_ready.loc[:, show_cols].head(12).copy()
+        if "event_date" in preview.columns:
+            preview["event_date"] = pd.to_datetime(preview["event_date"]).dt.strftime("%Y-%m-%d")
+        st.dataframe(preview, hide_index=True, **_stretch(st.dataframe))
+        bits = [f"共 {len(event_ready)} 条公司-公告"]
+        for column, label in (("signal_cost", "数智化/AI"), ("mda_esg_per_k", "绿色/ESG"), ("mda_geopol_per_k", "地缘")):
+            if column in event_ready.columns:
+                filled = int(pd.to_numeric(event_ready[column], errors="coerce").notna().sum())
+                bits.append(f"{label}有值 {filled} 条")
+        st.caption("，".join(bits) + "。这里只预览前 12 行。缺测不记成 0。")
 else:
     st.subheader("标准事件表")
     st.caption("固定列在左，你添加的变量在右。把鼠标放在列名上可看含义。空白行不会进入估计。")
 _show_guide()
-if source != "演示样本":
+if source == "我的事件表":
     report = st.session_state.get("audit_report")
     if isinstance(report, pd.DataFrame) and len(report):
         n_err = int((report["级别"] == "错误").sum())
@@ -896,7 +1296,7 @@ if source != "演示样本":
                 st.caption(f"有 {n_err} 条错误。改正之后才能运行。警告和周末提示不会删行。")
             else:
                 st.caption("没有必须改正的错误。警告请核对，周末会在运行时顺延。")
-if source != "演示样本":
+if source == "我的事件表":
     edited = st.data_editor(
         _align_grid(st.session_state.event_grid, st.session_state.custom_vars),
         num_rows="dynamic",
@@ -909,6 +1309,9 @@ if source != "演示样本":
     st.session_state.event_grid = edited
 
 pending = st.session_state.pop("pending_replay", None)
+_load_finished_job()
+if _job_needs_page(bool(run or pending)):
+    st.stop()
 if run or pending or st.session_state.get("study_result") is not None:
   if run or pending:
     if pending and not run:
@@ -930,6 +1333,15 @@ if run or pending or st.session_state.get("study_result") is not None:
             "output_dir": _private_run_dir(),
         }
         inputs = snap
+        if "spec_industries" in snap:
+            spec_industries = snap.get("spec_industries")
+            spec_event_types = snap.get("spec_event_types")
+        else:
+            spec_frame = snap.get("events_frame")
+            if spec_frame is None:
+                spec_frame = event_ready
+            spec_industries = _recorded_groups(snap.get("industries"), spec_frame, "industry")
+            spec_event_types = _recorded_groups(snap.get("event_types"), spec_frame, "event_type")
     else:
         cfg = load_config(config_path)
         cfg.mode = price_mode
@@ -948,6 +1360,7 @@ if run or pending or st.session_state.get("study_result") is not None:
         cfg.winsorize = 0.01 if do_winsor else 0.0
         cfg.market_lags = 1 if do_lags else 0
         cfg.anticipation_window = (-10, -6) if do_anticipation else None
+        cfg.drop_event_day_limit = bool(drop_limit)
         validate_windows(cfg)
         sent_events = event_ready
         if source != "演示样本" and drop_overlap and event_ready is not None:
@@ -955,6 +1368,17 @@ if run or pending or st.session_state.get("study_result") is not None:
         run_source = source
         run_window = car_window
         events_for_run = None if source == "演示样本" else sent_events
+        if source in {"我的事件表", "年报词频"} and st.session_state.get("text_signal_source") == "mda_digital_per_k":
+            probe = events_for_run
+            filled = (
+                probe is not None
+                and "signal_cost" in probe.columns
+                and pd.to_numeric(probe["signal_cost"], errors="coerce").notna().any()
+            )
+            if filled:
+                cfg.extra["signal_source"] = "mda_digital_per_k"
+        spec_industries = _recorded_groups(industries, event_ready, "industry")
+        spec_event_types = _recorded_groups(event_types, event_ready, "event_type")
         run_kwargs = {
             "industries": industries,
             "event_types": event_types,
@@ -981,7 +1405,23 @@ if run or pending or st.session_state.get("study_result") is not None:
             "industry_frame": _copy_frame(industry_frame),
             "factors_frame": _copy_frame(factors_frame),
             "price_mode": price_mode,
+            "spec_industries": spec_industries,
+            "spec_event_types": spec_event_types,
         }
+        if use_background:
+            job_id = _start_background_job(
+                cfg,
+                run_kwargs,
+                inputs,
+                run_source,
+                run_window,
+                spec_industries,
+                spec_event_types,
+            )
+            st.session_state.active_job = job_id
+            st.session_state.study_result = None
+            st.query_params["job"] = job_id
+            st.rerun()
     with st.status("正在计算累计异常收益…", expanded=True) as status:
         labels = {
             "inputs": "读取事件和行情",
@@ -990,27 +1430,46 @@ if run or pending or st.session_state.get("study_result") is not None:
             "placebo": "安慰剂",
             "export": "回归表与导出",
         }
+        progress = st.progress(0.0, text="准备计算")
+        floor = {"value": 0.0}
+
+        def _set_progress(value: float, text: str) -> None:
+            floor["value"] = max(floor["value"], value)
+            progress.progress(min(floor["value"], 1.0), text=text)
 
         def _on_step(key: str) -> None:
             status.update(label=labels.get(key, key))
+            marks = {"inputs": 0.15, "estimate": 0.55, "tests": 0.75, "placebo": 0.85, "export": 0.95}
+            if key in marks:
+                _set_progress(marks[key], labels.get(key, key))
+
+        def _on_download(done: int, total: int, symbol: str, from_cache: bool) -> None:
+            verb = "读取缓存" if from_cache else "下载"
+            fraction = 0.05 + 0.55 * (done / total if total else 1)
+            _set_progress(fraction, f"{verb} {symbol}（{done}/{total}）")
 
         try:
-            result = run_study(cfg, on_step=_on_step, **run_kwargs)
+            result = run_study(cfg, on_step=_on_step, on_download=_on_download, **run_kwargs)
         except Exception as exc:
             status.update(label="没有跑完", state="error")
             st.error(str(exc))
             st.stop()
+        _set_progress(1.0, "计算完成")
         status.update(label="计算完成", state="complete", expanded=False)
         st.session_state.study_result = result
         st.session_state.study_window = run_window
         st.session_state.study_source = run_source
+        _attach_session_spec(
+            result,
+            source=run_source,
+            industries=spec_industries,
+            event_types=spec_event_types,
+        )
         _remember_run(result, run_source, run_window, inputs)
   else:
     result = st.session_state.study_result
     cfg = result.config
     car_window = st.session_state.study_window
-  if st.session_state.get("study_source") != source:
-      st.warning("下面的数字还是上一次运行的结果。事件来源已经换了，再点一次「运行并导出」。")
   if result.simulated:
       st.warning("当前是模拟样本。下面的数字不能当作实证结果。")
   primary = result.tests[(result.tests.t1 == car_window[0]) & (result.tests.t2 == car_window[1])]
@@ -1038,6 +1497,12 @@ if run or pending or st.session_state.get("study_result") is not None:
       "portfolio": "很多事件落在同一天，所以用等权组合的时间序列检验。这一天是一次共同冲击。",
   }[primary["preferred"]]
   st.caption(f"窗口 [{car_window[0]}, {car_window[1]}]。星号来自首选检验。{preferred_note}")
+  specs = getattr(result, "specs", None)
+  if isinstance(specs, pd.DataFrame) and len(specs):
+      st.caption(spec_sentence(specs))
+      with st.expander("这次会话试过的规格", expanded=False):
+          st.dataframe(spec_display(specs), hide_index=True, **_stretch(st.dataframe))
+          st.caption("每一行是一次跑完的设定。换窗口、模型或分组再跑，会多一行。这不是新的显著性校正。")
   window_cards = []
   for row in result.tests.itertuples(index=False):
       mark = star_mark(row.p_preferred)
@@ -1295,76 +1760,78 @@ if run or pending or st.session_state.get("study_result") is not None:
           st.text_area("中文方法段", result.methods_zh, height=180)
       if getattr(result, "methods_en", ""):
           st.text_area("English methods note", result.methods_en, height=160)
-      if getattr(result, "manifest", None):
-          manifest_text = json.dumps(result.manifest, ensure_ascii=False, indent=2)
-          st.download_button(
-              "下载 manifest.json",
-              data=manifest_text.encode("utf-8"),
-              file_name="manifest.json",
-              mime="application/json",
-              key="dl-manifest",
-          )
-      for mode_name, pack in (result.placebos or {}).items():
-          nulls = np.asarray(pack.get("nulls", []), dtype=float)
-          nulls = nulls[np.isfinite(nulls)]
-          if nulls.size:
+      with st.expander("单个文件"):
+          st.caption("打包按钮里已经包含这些文件。需要单独拿走某一份时再打开。")
+          if getattr(result, "manifest", None):
+              manifest_text = json.dumps(result.manifest, ensure_ascii=False, indent=2)
               st.download_button(
-                  f"下载安慰剂抽取 {mode_name}",
-                  data=pd.DataFrame({"null_mean_car": nulls}).to_csv(index=False).encode("utf-8-sig"),
-                  file_name=f"placebo_{mode_name}.csv",
-                  mime="text/csv",
-                  key=f"dl-placebo-{mode_name}",
-                  help="小数收益率，不是百分点。",
+                  "下载 manifest.json",
+                  data=manifest_text.encode("utf-8"),
+                  file_name="manifest.json",
+                  mime="application/json",
+                  key="dl-manifest",
               )
-      file_cols = st.columns(2)
-      saved = Path(result.outputs["tables"])
-      names = [
-          "table_car.tex",
-          "table_summary.tex",
-          "table_regression.tex",
-          "table_placebo.tex",
-          "table_attrition.tex",
-      ]
-      for index, name in enumerate(names):
-          file_path = saved / name
-          if file_path.exists() and file_path.read_text(encoding="utf-8").strip():
-              file_cols[index % 2].download_button(
-                  f"下载 {name}",
-                  data=file_path.read_text(encoding="utf-8"),
-                  file_name=name,
-                  mime="text/plain",
-                  **_stretch(st.download_button),
-                  key=f"dl-{name}",
-              )
-      png_names = [
-          "fig_car_path.png",
-          "fig_car_path_by_industry.png",
-          "fig_car_path_by_type.png",
-          "fig_car_by_industry.png",
-          "fig_car_by_type.png",
-          "fig_placebo_in_time.png",
-          "fig_placebo_in_space.png",
-      ]
-      png_cols = st.columns(2)
-      for index, name in enumerate(png_names):
-          file_path = figure_dir / name
-          if file_path.exists():
-              png_cols[index % 2].download_button(
-                  f"下载 {name}",
-                  data=file_path.read_bytes(),
-                  file_name=name,
-                  mime="image/png",
-                  **_stretch(st.download_button),
-                  key=f"dl-{name}",
-              )
-      car_tex = saved / "table_car.tex"
-      if car_tex.exists() and car_tex.read_text(encoding="utf-8").strip():
-          with st.expander("CAR 表的 LaTeX 片段"):
+          for mode_name, pack in (result.placebos or {}).items():
+              nulls = np.asarray(pack.get("nulls", []), dtype=float)
+              nulls = nulls[np.isfinite(nulls)]
+              if nulls.size:
+                  st.download_button(
+                      f"下载安慰剂抽取 {mode_name}",
+                      data=pd.DataFrame({"null_mean_car": nulls}).to_csv(index=False).encode("utf-8-sig"),
+                      file_name=f"placebo_{mode_name}.csv",
+                      mime="text/csv",
+                      key=f"dl-placebo-{mode_name}",
+                      help="小数收益率，不是百分点。",
+                  )
+          file_cols = st.columns(2)
+          saved = Path(result.outputs["tables"])
+          names = [
+              "table_car.tex",
+              "table_summary.tex",
+              "table_regression.tex",
+              "table_placebo.tex",
+              "table_attrition.tex",
+          ]
+          for index, name in enumerate(names):
+              file_path = saved / name
+              if file_path.exists() and file_path.read_text(encoding="utf-8").strip():
+                  file_cols[index % 2].download_button(
+                      f"下载 {name}",
+                      data=file_path.read_text(encoding="utf-8"),
+                      file_name=name,
+                      mime="text/plain",
+                      **_stretch(st.download_button),
+                      key=f"dl-{name}",
+                  )
+          png_names = [
+              "fig_car_path.png",
+              "fig_car_path_by_industry.png",
+              "fig_car_path_by_type.png",
+              "fig_car_by_industry.png",
+              "fig_car_by_type.png",
+              "fig_placebo_in_time.png",
+              "fig_placebo_in_space.png",
+          ]
+          png_cols = st.columns(2)
+          for index, name in enumerate(png_names):
+              file_path = figure_dir / name
+              if file_path.exists():
+                  png_cols[index % 2].download_button(
+                      f"下载 {name}",
+                      data=file_path.read_bytes(),
+                      file_name=name,
+                      mime="image/png",
+                      **_stretch(st.download_button),
+                      key=f"dl-{name}",
+                  )
+          car_tex = saved / "table_car.tex"
+          if car_tex.exists() and car_tex.read_text(encoding="utf-8").strip():
+              st.caption("CAR 表的 LaTeX 片段")
               st.code(car_tex.read_text(encoding="utf-8"), language="latex")
-      window_csv = result.tests.to_csv(index=False).encode("utf-8-sig")
-      event_csv = result.events.to_csv(index=False).encode("utf-8-sig")
-      file_cols[0].download_button("下载 CAR 窗口表 CSV", window_csv, "car_windows.csv", "text/csv", **_stretch(st.download_button), key="dl-windows-csv")
-      file_cols[1].download_button("下载事件层 CAR CSV", event_csv, "event_car.csv", "text/csv", **_stretch(st.download_button), key="dl-event-csv")
+          window_csv = result.tests.to_csv(index=False).encode("utf-8-sig")
+          event_csv = result.events.to_csv(index=False).encode("utf-8-sig")
+          file_cols[0].download_button("下载 CAR 窗口表 CSV", window_csv, "car_windows.csv", "text/csv", **_stretch(st.download_button), key="dl-windows-csv")
+          file_cols[1].download_button("下载事件层 CAR CSV", event_csv, "event_car.csv", "text/csv", **_stretch(st.download_button), key="dl-event-csv")
       with st.expander("样本怎么筛出来的"):
           st.markdown(result.sample_log)
           attrition = getattr(result, "attrition", None)
@@ -1389,7 +1856,7 @@ else:
     step_a, step_b, step_c = st.columns(3)
     with step_a.container(border=True):
         st.markdown("**1. 放入事件**")
-        st.caption("演示样本可以直接运行。自己的公告改到左侧「我的事件表」，在标准列里填写。")
+        st.caption("演示样本可以直接运行。年报词频直接读文本特征引擎的因子表。其他公告改到左侧「我的事件表」。")
     with step_b.container(border=True):
         st.markdown("**2. 加上变量**")
         st.caption("信号成本、规模、合法性缺口，或你自己起的数值变量。文本列只作标记。")
@@ -1400,7 +1867,7 @@ else:
 with st.expander("方法说明"):
     st.markdown(
         """
-**市场模型。** 在估计窗里，为每家公司单独拟合「个股收益 = 截距 + 斜率 × 市场基准收益」。事件窗里的实际收益减去这条拟合值，才是异常收益。市场调整则不估计截距和斜率，直接减市场基准收益。基准默认是沪深 300。行业基准换成你上传的行业指数；三因子使用你上传的 mkt、smb、hml。程序不下载申万行业，也不生成因子。交易日仍按宽基指数对齐。
+**市场模型。** 在估计窗里，为每家公司单独拟合「个股收益 = 截距 + 斜率 × 市场基准收益」。事件窗里的实际收益减去这条拟合值，才是异常收益。市场调整则不估计截距和斜率，直接减市场基准收益。基准默认是沪深 300。不上传文件时，行业基准用申万一级，三因子用 Liu-Stambaugh-Yuan 的 CH3 日频（市场超额收益、SMB、VMG）。VMG 不是 Fama-French 的 HML。五因子和 Carhart 仍要上传。交易日仍按宽基指数对齐。
 
 **盘后。** 事件表可以加一列 after_close。写成「盘后」或 1 时，从记录日的下一个交易日起对齐，并且仍要落在 10 个日历日以内。不填就按记录日当天对齐。
 
@@ -1414,9 +1881,13 @@ with st.expander("方法说明"):
 
 **安慰剂。** 时间安慰剂把事件日挪到估计窗之前，并在伪日期上重新拟合，不是把真实事件的异常收益平移。截面安慰剂在样本内重配价格序列后重新拟合。百分位只说明真实日期在这批伪日期里的位置。两侧都不是对照组，p 值也不是因果 p 值。
 
-**推断补充。** 星号来自未校正的首选 p 值。p BH 只调整窗口表里这些首选 p 值。秩 t 用来看厚尾，不是处理效应检验。回归可以另给公司和事件日的双向聚类标准误，以及不含固定效应规格上的 wild cluster bootstrap p。星号仍来自聚类标准误。涨跌停标记按板块和公司名推断带宽，不是交易所状态表，程序不因此删行。
+**推断补充。** 星号来自未校正的首选 p 值。p BH 只调整窗口表里这些首选 p 值。秩 t 用来看厚尾，不是处理效应检验。回归可以另给公司和事件日的双向聚类标准误，以及不含固定效应规格上的 wild cluster bootstrap p。星号仍来自聚类标准误。涨跌停默认只标记。勾选「剔除事件日涨跌停」后，交易所名单能对上的用名单，对不上的用板块带宽，这些行不进入 CAR。
 
-**不要把星号读满。** 同时看 [-1, 1]、[-3, 3]、[-5, 5]，再按行业和事件类型切开，会提高「至少有一个显著」的机会。事件日扎在同一天时，横截面 t 会把显著性说高，这时看组合时间序列检验。回归系数是相关，不是平均处理效应。
+**不要把星号读满。** 同时看 [-1, 1]、[-3, 3]、[-5, 5]，再按行业和事件类型切开，会提高「至少有一个显著」的机会。事件日扎在同一天时，横截面 t 会把显著性说高，这时看组合时间序列检验。回归系数是相关，不是平均处理效应。每次跑完会登记窗口、模型和分组。导出里的「共试了 N 种规格」只是这份记录，星号不按这 N 次再校正。
+
+**年报词频。** 左侧这一项直接读年报文本特征引擎已经导出的因子表，不把年报正文复制进本项目。管理层讨论有三列每千词：数智化/AI、绿色/ESG、地缘。signal_cost 只取数智化/AI，作为披露具体程度的代理，不是已经测得的信号成本。绿色/ESG 和地缘保留原列，不写入合法性缺口。缺测留空，不记成 0。有公告日、且可用日是下一天时，事件日记公告日并按盘后对齐。只有可用日时不再后移。找不到本机导出时，可以改传同一份文件。
+
+**后台。** 事件达到 30 条且要下载行情时，计算放到后台。页面可以离开。地址栏里的任务链接用来取回结果。点「查看进度」才会刷新，页面不会自己反复刷新。演示样本和较小的运行仍在页面里算完。
         """
     )
 

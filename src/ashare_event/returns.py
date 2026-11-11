@@ -295,6 +295,7 @@ def estimate_events(
     industry_frame: pd.DataFrame | None = None,
     factors_frame: pd.DataFrame | None = None,
     market_lags: int = 0,
+    drop_event_day_limit: bool = False,
 ) -> Estimation:
     if model not in _MODELS:
         raise ValueError("model 只能是 market、market_adjusted、industry、ff3、ff5 或 carhart。")
@@ -307,7 +308,7 @@ def estimate_events(
 
         industry_map = prepare_industry_returns(industry_frame)
         if not industry_map:
-            raise ValueError("行业基准需要行业指数行情，列至少包括行业、日期、收盘。程序不会自动匹配申万指数。")
+            raise ValueError("行业基准需要行业指数行情，列至少包括行业、日期、收盘。")
     if model in FACTOR_COLUMNS:
         from ashare_event.market import prepare_factors
 
@@ -316,11 +317,12 @@ def estimate_events(
         missing = [] if factors is None else [name for name in factor_names if name not in factors.columns]
         if factors is None or missing:
             if model == "ff5":
-                raise ValueError("五因子模型需要日期、mkt、smb、hml、rmw、cma。程序不生成因子收益。")
+                raise ValueError("五因子模型需要日期、mkt、smb、hml、rmw、cma。内置 CH3 没有 RMW 和 CMA。")
             if model == "carhart":
-                raise ValueError("Carhart 模型需要日期、mkt、smb、hml、umd。程序不生成因子收益。")
-            raise ValueError("三因子模型需要日期、mkt、smb、hml。程序不生成因子收益。")
-        factor_indexed = factors.set_index("date")[list(factor_names)]
+                raise ValueError("Carhart 模型需要日期、mkt、smb、hml、umd。内置 CH3 没有 UMD。")
+            raise ValueError("三因子模型需要日期、mkt、smb、hml。")
+        keep_factor_cols = [*factor_names, *(["rf"] if "rf" in factors.columns else [])]
+        factor_indexed = factors.set_index("date")[keep_factor_cols]
     est_left, est_right = estimation_window
     windows = list(dict.fromkeys([*event_windows, tuple(regression_window)]))
     slice_left = min(est_left, path_window[0], min(window[0] for window in windows))
@@ -375,23 +377,29 @@ def estimate_events(
             }
         )
         if model == "industry":
-            series = industry_map.get(str(getattr(event, "industry", "")))
+            sw_name = str(getattr(event, "sw_l1", "") or "")
+            if sw_name in {"", "nan", "None"}:
+                sw_name = str(getattr(event, "industry", ""))
+            series = industry_map.get(sw_name)
             if series is None:
                 _drop(event, "no_industry_benchmark")
                 continue
             window_frame["mkt_ret"] = series.reindex(window_frame["date"]).to_numpy(dtype=float)
         fac_cols = [f"fac_{name}" for name in factor_names]
+        has_rf = bool(factor_names) and factor_indexed is not None and "rf" in factor_indexed.columns
         if factor_names:
             fac = factor_indexed.reindex(window_frame["date"])
             for name in factor_names:
                 window_frame[f"fac_{name}"] = fac[name].to_numpy(dtype=float)
             window_frame["mkt_ret"] = window_frame["fac_mkt"]
+            if has_rf:
+                window_frame["rf"] = fac["rf"].to_numpy(dtype=float)
         est_mask = (window_frame["rel_day"] >= est_left) & (window_frame["rel_day"] <= est_right)
         if factor_names:
-            fit = fit_factor_model(
-                window_frame.loc[est_mask, "ret"].to_numpy(dtype=float),
-                window_frame.loc[est_mask, fac_cols].to_numpy(dtype=float),
-            )
+            y_est = window_frame.loc[est_mask, "ret"].to_numpy(dtype=float)
+            if has_rf:
+                y_est = y_est - window_frame.loc[est_mask, "rf"].to_numpy(dtype=float)
+            fit = fit_factor_model(y_est, window_frame.loc[est_mask, fac_cols].to_numpy(dtype=float))
         else:
             fit_kind = "market_adjusted" if model == "market_adjusted" else "market"
             y_est = window_frame.loc[est_mask, "ret"].to_numpy(dtype=float)
@@ -409,7 +417,10 @@ def estimate_events(
         else:
             predicted = fit["alpha"] + fit["beta"] * window_frame["mkt_ret"]
         window_frame["predicted"] = predicted
-        window_frame["ar"] = window_frame["ret"] - window_frame["predicted"]
+        observed = window_frame["ret"].to_numpy(dtype=float)
+        if has_rf:
+            observed = observed - window_frame["rf"].to_numpy(dtype=float)
+        window_frame["ar"] = observed - window_frame["predicted"]
         window_frame["resid"] = np.where(est_mask, window_frame["ar"], np.nan)
         window_frame["event_id"] = event.event_id
         window_frame["firm_id"] = event.firm_id
@@ -428,7 +439,12 @@ def estimate_events(
         day0 = window_frame.loc[window_frame["rel_day"] == 0, "ret"]
         ret0 = float(day0.iloc[0]) if len(day0) else np.nan
         record["limit_band"] = band
-        record["limit_hit"] = bool(is_limit_hit(ret0, band))
+        band_hit = bool(is_limit_hit(ret0, band))
+        record["limit_hit"] = band_hit
+        exchange_hit = bool(getattr(event, "limit_exchange", False))
+        if drop_event_day_limit and (exchange_hit or band_hit):
+            _drop(event, "limit_day")
+            continue
         span_source = [item for item in windows if int(item[1]) >= 0] or list(windows)
         span_left = min(int(item[0]) for item in span_source)
         span_right = max(int(item[1]) for item in span_source)
@@ -448,6 +464,8 @@ def estimate_events(
             complete = piece["ar"].notna().all() and len(piece) == (right_w - left_w + 1)
             key = window_suffix(left_w, right_w)
             raw_ret = piece["ret"].to_numpy(dtype=float)
+            if has_rf:
+                raw_ret = raw_ret - piece["rf"].to_numpy(dtype=float)
             raw_pred = piece["predicted"].to_numpy(dtype=float)
             buy_hold = np.isfinite(raw_ret) & np.isfinite(raw_pred)
             if require_complete_window and not complete:

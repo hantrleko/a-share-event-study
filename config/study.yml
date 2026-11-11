@@ -35,6 +35,8 @@
 #   - after_close, when present, maps a post-close announcement to the next trading day.
 #   - Price-limit flags are a board/name heuristic, not an exchange status file.
 #   - Stars are not multiplicity-adjusted. p BH adjusts only the preferred p-values in the window table.
+#   - A spec log records windows, models, and groups that were run. It is not a further BH or Holm adjustment.
+#   - Filing-text available_date is already announcement T+1. Do not shift it again.
 #   - Two-way cluster columns use firm and event date. They are still associations.
 # ============================================================
 

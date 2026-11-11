@@ -6,7 +6,7 @@
 
 ## 在线使用
 
-打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。当前版本 V2.1。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。网站上的每次运行写到单独的临时目录，不会改服务器上的 `paper/`。命令行不传输出目录时，仍写到配置里的 `paper/tabs`、`paper/figs`。样本记录现在有逐行剔除名单，人数表的分项相加等于读入人数，不改变 CAR。
+打开 [事件研究网站](https://a-share-event-study-production.up.railway.app)。仓库版本与在线网站都是 V2.4。演示样本不需要安装。源码在 [hantrleko/a-share-event-study](https://github.com/hantrleko/a-share-event-study)。网站上的每次运行写到单独的临时目录，不会改服务器上的 `paper/`。命令行不传输出目录时，仍写到配置里的 `paper/tabs`、`paper/figs`。样本记录现在有逐行剔除名单，人数表的分项相加等于读入人数，不改变 CAR。重复运行会复用已经覆盖该区间的行情缓存，进度条区分缓存和新下载；切换事件来源会清掉上一次结果；导出以打包下载为主，单文件收在折叠里；侧栏默认只留事件、窗口和模型，其余在「进阶」。V2.3 增加申万一级行业基准、本机 CH3 三因子、可选的事件日涨跌停剔除，以及 2023-07-13 人工智能管理办法的四公司对照案例。对照案例的数字不是论文结论。
 
 ## 先跑演示
 
@@ -33,6 +33,10 @@ streamlit run app/streamlit_app.py
 
 切到「我的事件表」后，可以下载带两套示例事件的 CSV，或只下载当前表头。示例是政策发布日，公司名带「示例」。名称里还有这两个字时，运行按钮会停用，AKShare 也不会下载。核对后再删掉。命令行仍可读 `config/study.yml`。
 
+年报词频是侧栏里的一项事件来源，直接读年报文本特征引擎（listed-filing-textmine）已经导出的因子表，不把该项目的代码或年报正文复制进来。查找顺序是环境变量 `ASHARE_FILING_TEXT_DIR`，然后是该项目下的 `data/factor_panel/output`、`data/workspace/output`、`data/output` 和 `data/validation/output`。变量若已设置，就不再改看其他位置。找不到时可以改传同一份 `panel_factor`、宽表或 regression_readiness。有公告日、且可用日是公告日的下一天时，事件日记公告日并勾上盘后。只有可用日时，事件日用可用日，不再后移，因为该引擎的可用日已经是公告日的次日。管理层讨论的数智化/AI 每千词写入 `signal_cost`，绿色/ESG 与地缘每千词各自留列，不写入合法性缺口。三者都是披露用词强度，缺测不记成 0。报告期可以按 `fiscal_year` 收窄，它不是事件日。
+
+每次跑完会登记窗口、模型和分组。导出里有「共试了 N 种规格」。星号仍来自每一次自己的首选 p 值，不按这 N 次再做校正。事件达到 30 条且要下载行情时，计算放在后台，用地址栏里的任务链接取回；演示样本和较小的运行仍在页面里算完。任务文件写在 `data/jobs/`，不提交。
+
 表在 `paper/tabs/*.tex`，图在 `paper/figs/*.pdf`。论文里 `\input` 这些 tex，不要手抄数字。方法段骨架在 `paper/snippets/methods_skeleton.tex`。样本怎么被筛掉，写在 `output/logs/sample_log.md`。逐行原因在 `data/processed/dropped_events.csv`，人数表在 `paper/tabs/table_attrition.tex`。
 
 ## 默认设定
@@ -42,7 +46,7 @@ streamlit run app/streamlit_app.py
 | 项目 | 默认 | 要改时 |
 | --- | --- | --- |
 | 估计对象 | 市场模型累计异常收益 | 不是处理效应 |
-| 模型 | 估计窗内的市场模型 | `market_adjusted` 直接扣基准；`industry`、`ff3`、`ff5`、`carhart` 要用你自己的行业指数或因子，程序不下载 |
+| 模型 | 估计窗内的市场模型 | `market_adjusted` 直接扣基准。`industry` 不上传时用申万一级。`ff3` 不上传时用本机的 Liu-Stambaugh-Yuan CH3 日频（市场超额、SMB、VMG）。`ff5` 和 `carhart` 仍要上传，因为这份库没有 RMW、CMA、UMD |
 | 估计窗 | [-250, -31] | 必须整段落在路径窗和所有 CAR 窗之前 |
 | 报告窗 | [-1, 1]、[-3, 3]、[-5, 5] | 回归默认用 [-1, 1] |
 | 路径图 | [-10, 10] | 与回归窗分开 |
@@ -50,7 +54,7 @@ streamlit run app/streamlit_app.py
 | 事件日 | 非交易日向后 10 个日历日内的第一个交易日 | 停牌缺一天则该窗口作废 |
 | 聚类 | `firm_id` | 公司是依赖单位 |
 | 回归 | pyfixest，公司聚类 | 装不上时退回 statsmodels |
-| 星号 | 10% / 5% / 1% | 平均 CAR 的星号来自未校正的首选检验。p BH 只调整窗口表里的首选 p 值，不改星号 |
+| 星号 | 10% / 5% / 1% | 平均 CAR 的星号来自未校正的首选检验。p BH 只调整窗口表里的首选 p 值，不改星号。规格表只登记试过的窗口、模型和分组，不按试了几次再校正 |
 | 单位 | 表和图乘以 100 | CSV 里仍是小数收益率 |
 | 安慰剂 | 时间安慰剂与截面安慰剂各 200 次 | 见下 |
 

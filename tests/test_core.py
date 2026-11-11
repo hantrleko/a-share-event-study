@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ashare_event.config import ConfigError, load_config
 from ashare_event.inference import kp_factor
-from ashare_event.market import MarketDataError, load_or_download_stock, normalize_ohlc
+from ashare_event.market import MarketDataError, download_cached_market, load_or_download_stock, normalize_ohlc
 from ashare_event.pipeline import run_study
 from ashare_event.returns import estimate_events
 from ashare_event.schema import SchemaError, apply_column_roles, load_events, normalize_code
@@ -303,6 +303,80 @@ class DesignTests(unittest.TestCase):
             )
             with self.assertRaises(MarketDataError):
                 load_or_download_stock("000001", "2020-01-01", "2024-12-31", "qfq", raw)
+
+    def test_cached_market_reports_hits_without_download(self):
+        from ashare_event import market as market_mod
+
+        def _boom(*_args, **_kwargs):
+            raise AssertionError("不应再访问行情接口")
+
+        calls = []
+
+        def _on_item(done, total, symbol, hit):
+            calls.append((done, total, symbol, hit))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp)
+            for code in ("000001", "000002"):
+                path = raw / "prices" / f"{code}.parquet"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(
+                    {"code": [code], "date": [pd.Timestamp("2023-07-13")], "close": [10.0]}
+                ).to_parquet(path, index=False)
+                path.with_suffix(".json").write_text(
+                    '{"start": "2020-01-01", "end": "2024-12-31", "adjust": "qfq"}',
+                    encoding="utf-8",
+                )
+            index_path = raw / "index" / "000300.parquet"
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"date": [pd.Timestamp("2023-07-13")], "close": [4000.0]}).to_parquet(index_path, index=False)
+            index_path.with_suffix(".json").write_text(
+                '{"start": "2020-01-01", "end": "2024-12-31"}',
+                encoding="utf-8",
+            )
+            original_stock, original_index = market_mod.fetch_stock, market_mod.fetch_index
+            market_mod.fetch_stock = _boom
+            market_mod.fetch_index = _boom
+            try:
+                prices, _market, stats = download_cached_market(
+                    ["1", "2"],
+                    "000300",
+                    "2023-01-01",
+                    "2023-12-31",
+                    "qfq",
+                    raw,
+                    workers=2,
+                    on_item=_on_item,
+                )
+                self.assertEqual(stats, {"hit": 3, "miss": 0})
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(all(item[3] for item in calls))
+                self.assertEqual(calls[-1][0], calls[-1][1])
+                self.assertEqual(set(prices["code"]), {"000001", "000002"})
+                for code in ("000001", "000002"):
+                    (raw / "prices" / f"{code}.parquet").unlink()
+                index_path.unlink()
+                calls.clear()
+                _again, _market_again, stats_again = download_cached_market(
+                    ["000001", "000002"],
+                    "000300",
+                    "2023-01-01",
+                    "2023-12-31",
+                    "qfq",
+                    raw,
+                    workers=2,
+                    on_item=_on_item,
+                )
+                self.assertEqual(stats_again, {"hit": 3, "miss": 0})
+                self.assertEqual(len(_again), 2)
+                self.assertTrue(all(item[3] for item in calls))
+            finally:
+                market_mod.fetch_stock = original_stock
+                market_mod.fetch_index = original_index
+                with market_mod._MEMORY_LOCK:
+                    for code in ("000001", "000002"):
+                        market_mod._MEMORY.pop(str((raw / "prices" / f"{code}.parquet").resolve()), None)
+                    market_mod._MEMORY.pop(str(index_path.resolve()), None)
 
 
 if __name__ == "__main__":

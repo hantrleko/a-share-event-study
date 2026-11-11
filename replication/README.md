@@ -17,7 +17,7 @@ python -m ashare_event run --config config/study.yml
 
 命令行不传输出目录时，文件进 `paper/`、`output/` 和 `data/processed/`。网站每次运行使用单独的临时目录，避免同时使用的人互相覆盖。同一次运行还会写出 `manifest.json`、中英文方法段、VIF 和变量字典。
 
-`model` 可以是 `market`、`market_adjusted`、`industry`、`ff3`、`ff5` 或 `carhart`。行业指数和因子文件都要自己提供，程序不下载。五因子需要 `rmw`、`cma`，Carhart 需要 `umd`。事件表可选列 `after_close`：标成盘后时，从记录日的下一个交易日起对齐。安慰剂在伪日期上重新拟合估计窗。星号来自未校正的首选 p 值；p BH 只调整窗口表里的首选 p 值。
+`model` 可以是 `market`、`market_adjusted`、`industry`、`ff3`、`ff5` 或 `carhart`。`industry` 不上传时用申万一级；`ff3` 不上传时用本机 CH3（市场超额、SMB、VMG，不是 Fama-French 五因子）。五因子需要 `rmw`、`cma`，Carhart 需要 `umd`，这两项仍要上传。事件表可选列 `after_close`：标成盘后时，从记录日的下一个交易日起对齐。安慰剂在伪日期上重新拟合估计窗。星号来自未校正的首选 p 值；p BH 只调整窗口表里的首选 p 值。每次跑完会在 `processed/specs_tried.csv` 和 `table_specs.tex` 登记这一次的窗口、模型和分组。这张表不是对多次尝试的 BH 或 Holm 校正。年报词频就地读取年报文本特征引擎已导出的因子表，或由使用者改传同一份文件，不随复现包下载。
 
 对照规格不进主程序。需要时：
 

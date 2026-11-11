@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,8 +38,7 @@ from ashare_event.grouping import build_group_frames, write_group_figures
 from ashare_event.inference import RBAR_MAX_EVENTS, bh_adjust, mean_residual_correlation, summarize_window
 from ashare_event.manifest import build_manifest
 from ashare_event.market import (
-    load_or_download_index,
-    load_or_download_stock,
+    download_cached_market,
     read_price_file,
     resolve_raw_dir,
     sample_date_range,
@@ -51,6 +49,7 @@ from ashare_event.regression import fit_car_regressions, regression_covariates
 from ashare_event.returns import add_peer_count, estimate_events, winsorize_events
 from ashare_event.schema import read_events_csv
 from ashare_event.simulate import simulate
+from ashare_event.specs import spec_row, spec_table, spec_tex
 from ashare_event.tables import (
     DROP_LABELS,
     DROP_REASON_ORDER,
@@ -89,6 +88,7 @@ class StudyResult:
     anticipation: dict | None = None
     dropped_events: pd.DataFrame | None = None
     attrition: pd.DataFrame | None = None
+    specs: pd.DataFrame | None = None
 
 
 def _load_inputs(
@@ -99,6 +99,8 @@ def _load_inputs(
     events_frame: pd.DataFrame | None = None,
     prices_frame: pd.DataFrame | None = None,
     market_frame: pd.DataFrame | None = None,
+    on_download=None,
+    fetch_stats: dict | None = None,
 ):
     """Return kept events, prices, market, simulated flag, the pre-filter count, and screened rows."""
     if cfg.mode == "demo":
@@ -131,17 +133,18 @@ def _load_inputs(
         raw = resolve_raw_dir(cfg.root)
         codes = sorted(events["code"].unique())
         workers = max(1, int(os.environ.get("ASHARE_DOWNLOAD_WORKERS", "4")))
-
-        def _one(code: str):
-            return load_or_download_stock(code, start, end, cfg.adjust, raw)
-
-        if workers == 1 or len(codes) <= 1:
-            frames = [_one(code) for code in codes]
-        else:
-            with ThreadPoolExecutor(max_workers=min(workers, len(codes))) as pool:
-                frames = list(pool.map(_one, codes))
-        prices = pd.concat(frames, ignore_index=True)
-        market = load_or_download_index(cfg.benchmark, start, end, raw)
+        prices, market, stats = download_cached_market(
+            codes,
+            cfg.benchmark,
+            start,
+            end,
+            cfg.adjust,
+            raw,
+            workers=workers,
+            on_item=on_download,
+        )
+        if fetch_stats is not None:
+            fetch_stats.update(stats)
     return events, prices, market, simulated, loaded_n, screened
 
 
@@ -252,12 +255,35 @@ def _sample_log(cfg: StudyConfig, loaded: int, filtered: int, estimation, tests:
         "日历时间 t、广义符号 z 和 KP 调整后的秩检验是补充列，不改变首选规则。BHAR 与 CAR 分列存放。",
         "",
     ]
-    if "limit_hit" in kept.columns and len(kept):
+    if cfg.drop_event_day_limit:
+        lines.append(
+            "- 已剔除事件日涨跌停。交易所涨停池不含 ST 和科创板，跌停池只覆盖近 30 日；"
+            "名单没有覆盖到的，仍用板块带宽。停牌名单只作记录，不额外删行。"
+        )
+    elif "limit_hit" in kept.columns and len(kept):
         n_hit = int(pd.Series(kept["limit_hit"]).fillna(False).astype(bool).sum())
         lines.append(
             f"- 事件日涨跌幅靠近涨跌停带宽：{n_hit}。"
-            "这是按代码板块和公司名称做的启发式标记，不是交易所涨跌停状态表，程序没有因此删行。"
+            "这是按代码板块和公司名称做的启发式标记。默认不因此删行。"
         )
+    source = cfg.extra.get("industry_source")
+    if source == "shenwan_l1":
+        lines.append("- 行业基准是申万一级指数，按分类历史里事件日当天有效的一级行业匹配。事件表里的行业名称仍只用于筛选。")
+    factor_source = cfg.extra.get("factor_source")
+    if factor_source == "ch3":
+        lines.append(
+            "- 三因子用 Liu-Stambaugh-Yuan CH3 日频：市场超额收益、SMB、VMG。VMG 放在 hml 列里，它不是 Fama-French 的 HML。"
+            "个股收益先减去同一天的无风险利率。这份库没有 RMW、CMA、UMD。"
+        )
+    if cfg.extra.get("signal_source") == "mda_digital_per_k":
+        lines.append(
+            "- signal_cost 取年报文本特征引擎里管理层讨论的数智化/AI 每千词。绿色/ESG 与地缘每千词各自成列，不写入合法性缺口。"
+            "三者都是披露用词强度，不是信号成本、ESG 表现或地缘冲击，也不是已经识别的机制。"
+        )
+    if "suspended" in kept.columns and len(kept):
+        n_suspended = int(pd.Series(kept["suspended"]).fillna(False).astype(bool).sum())
+        if n_suspended:
+            lines.append(f"- 进入 CAR 的事件里，事件日出现在停复牌名单上的有 {n_suspended} 条。名单没有覆盖到的日子不会被当成停牌。")
     if "limit_hit_days" in kept.columns and len(kept):
         lines.append(
             f"- 事件窗内涨跌停天数合计：{int(pd.to_numeric(kept['limit_hit_days'], errors='coerce').fillna(0).sum())}。"
@@ -297,6 +323,7 @@ def run_study(
     factors_frame: pd.DataFrame | None = None,
     output_dir: str | Path | None = None,
     on_step=None,
+    on_download=None,
 ) -> StudyResult:
     from ashare_event.config import validate_windows
 
@@ -313,6 +340,7 @@ def run_study(
             on_step(key)
 
     _step("inputs")
+    fetch_stats: dict = {}
     filtered, prices, market, simulated, loaded_n, screened = _load_inputs(
         cfg,
         rng,
@@ -321,7 +349,19 @@ def run_study(
         events_frame=events_frame,
         prices_frame=prices_frame,
         market_frame=market_frame,
+        on_download=on_download,
+        fetch_stats=fetch_stats,
     )
+    from ashare_event.reference import apply_builtin
+
+    filtered, industry_frame, factors_frame, reference_notes = apply_builtin(
+        cfg,
+        filtered,
+        industry_frame,
+        factors_frame,
+        on_item=on_download,
+    )
+    cfg.extra.update(reference_notes)
     _step("estimate")
     compute_windows = list(cfg.event_windows)
     if cfg.anticipation_window is not None and tuple(cfg.anticipation_window) not in compute_windows:
@@ -340,6 +380,7 @@ def run_study(
         industry_frame=industry_frame,
         factors_frame=factors_frame,
         market_lags=int(cfg.market_lags or 0),
+        drop_event_day_limit=bool(cfg.drop_event_day_limit),
     )
     if estimation.events.empty:
         counts = estimation.dropped["reason"].value_counts().to_dict()
@@ -421,6 +462,11 @@ def run_study(
         cfg.language,
     )
     log = _sample_log(cfg, loaded_n, len(filtered), estimation, tests, simulated)
+    if fetch_stats:
+        log += (
+            f"\n行情：缓存 {int(fetch_stats.get('hit', 0))} 条，新下载 {int(fetch_stats.get('miss', 0))} 条。"
+            "同一进程里，已经覆盖这次区间的股票和指数不会再次下载。原始行情文件不覆盖。\n"
+        )
     if cfg.anticipation_window is not None:
         left, right = cfg.anticipation_window
         overlap = any(not (right < window[0] or window[1] < left) for window in cfg.event_windows)
@@ -469,6 +515,7 @@ def run_study(
         dropped_events=dropped_events,
         attrition=attrition,
     )
+    result.specs = spec_table([spec_row(result, source=cfg.mode, industries=industries, event_types=event_types)])
     if export:
         _step("export")
         result.outputs = export_result(result, dest=output_dir)
@@ -567,6 +614,9 @@ def export_result(result: StudyResult, dest: str | Path | None = None) -> dict[s
         )
     if result.dropped_events is not None:
         result.dropped_events.to_csv(paths["processed"] / "dropped_events.csv", index=False)
+    if isinstance(result.specs, pd.DataFrame) and len(result.specs):
+        result.specs.to_csv(paths["processed"] / "specs_tried.csv", index=False)
+        write_text(paths["tables"] / "table_specs.tex", spec_tex(result.specs))
     write_text(paths["logs"] / "sample_log.md", result.sample_log)
     frame = result.events.copy()
     frame["simulated"] = result.simulated

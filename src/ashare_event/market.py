@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +22,10 @@ CLOSE_NAMES = {"收盘", "close", "收盘价"}
 
 class MarketDataError(RuntimeError):
     """Prices could not be loaded or the raw cache does not cover the sample."""
+
+
+_MEMORY: dict[str, tuple] = {}
+_MEMORY_LOCK = threading.Lock()
 
 
 def normalize_ohlc(frame: pd.DataFrame, code: str | None = None) -> pd.DataFrame:
@@ -124,7 +130,28 @@ def _meta_covers(meta: dict, start_ts, end_ts, adjust: str | None) -> bool:
     return meta.get("adjust") == adjust
 
 
+def _remember(path: Path, start_ts, end_ts, adjust, frame: pd.DataFrame) -> None:
+    with _MEMORY_LOCK:
+        _MEMORY[str(Path(path).resolve())] = (pd.Timestamp(start_ts), pd.Timestamp(end_ts), adjust, frame.copy())
+
+
+def _recall(path: Path, start_ts, end_ts, adjust: str | None) -> pd.DataFrame | None:
+    with _MEMORY_LOCK:
+        item = _MEMORY.get(str(Path(path).resolve()))
+    if item is None:
+        return None
+    cached_start, cached_end, cached_adjust, frame = item
+    if not (cached_start <= start_ts and cached_end >= end_ts):
+        return None
+    if adjust is not None and cached_adjust != adjust:
+        return None
+    return frame.copy()
+
+
 def _load_if_covers(path: Path, start_ts, end_ts, adjust: str | None) -> pd.DataFrame | None:
+    remembered = _recall(path, start_ts, end_ts, adjust)
+    if remembered is not None:
+        return remembered
     if not path.exists():
         return None
     meta_path = path.with_suffix(".json")
@@ -133,7 +160,8 @@ def _load_if_covers(path: Path, start_ts, end_ts, adjust: str | None) -> pd.Data
         return None
     frame = _read_cache(path)
     frame["date"] = pd.to_datetime(frame["date"])
-    return frame
+    _remember(path, meta.get("start", start_ts), meta.get("end", end_ts), meta.get("adjust"), frame)
+    return frame.copy()
 
 
 def _read_cache(path: Path) -> pd.DataFrame:
@@ -171,6 +199,29 @@ def _store_download(frame: pd.DataFrame, path: Path, start_ts, end_ts, adjust, s
         json.dumps(_meta(start_ts, end_ts, adjust, len(frame), symbol), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _remember(path, start_ts, end_ts, adjust, frame)
+
+
+def _cached_or_fetch(path: Path, start_ts, end_ts, adjust, symbol: str, fetch) -> tuple[pd.DataFrame, bool]:
+    """Return prices and whether they came from cache. An existing file is never replaced."""
+    loaded = _load_if_covers(path, start_ts, end_ts, adjust)
+    if loaded is not None:
+        return loaded, True
+    if path.exists() and not _extend_enabled():
+        _coverage_error(path, _read_meta(path), start_ts.date(), end_ts.date(), adjust)
+    if path.exists():
+        side = path.with_name(path.stem + ".extended.parquet")
+        loaded = _load_if_covers(side, start_ts, end_ts, adjust)
+        if loaded is not None:
+            return loaded, True
+        if side.exists():
+            _coverage_error(side, _read_meta(side), start_ts.date(), end_ts.date(), adjust)
+        frame = fetch()
+        _store_download(frame, side, start_ts, end_ts, adjust, symbol)
+        return frame, False
+    frame = fetch()
+    _store_download(frame, path, start_ts, end_ts, adjust, symbol)
+    return frame, False
 
 
 def load_or_download_stock(
@@ -180,49 +231,90 @@ def load_or_download_stock(
     adjust: str,
     raw_dir: Path,
 ) -> pd.DataFrame:
-    path = raw_dir / "prices" / f"{code}.parquet"
     start_ts, end_ts = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
-    loaded = _load_if_covers(path, start_ts, end_ts, adjust)
-    if loaded is not None:
-        return loaded
-    if path.exists() and not _extend_enabled():
-        _coverage_error(path, _read_meta(path), start_ts.date(), end_ts.date(), adjust)
-    if path.exists():
-        side = path.with_name(path.stem + ".extended.parquet")
-        loaded = _load_if_covers(side, start_ts, end_ts, adjust)
-        if loaded is not None:
-            return loaded
-        if side.exists():
-            _coverage_error(side, _read_meta(side), start_ts.date(), end_ts.date(), adjust)
-        frame = fetch_stock(code, _ymd(start_ts), _ymd(end_ts), adjust)
-        _store_download(frame, side, start_ts, end_ts, adjust, code)
-        return frame
-    frame = fetch_stock(code, _ymd(start_ts), _ymd(end_ts), adjust)
-    _store_download(frame, path, start_ts, end_ts, adjust, code)
+    frame, _hit = _cached_or_fetch(
+        raw_dir / "prices" / f"{code}.parquet",
+        start_ts,
+        end_ts,
+        adjust,
+        code,
+        lambda: fetch_stock(code, _ymd(start_ts), _ymd(end_ts), adjust),
+    )
     return frame
 
 
 def load_or_download_index(symbol: str, start, end, raw_dir: Path) -> pd.DataFrame:
-    path = raw_dir / "index" / f"{symbol}.parquet"
     start_ts, end_ts = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
-    loaded = _load_if_covers(path, start_ts, end_ts, None)
-    if loaded is not None:
-        return loaded
-    if path.exists() and not _extend_enabled():
-        _coverage_error(path, _read_meta(path), start_ts.date(), end_ts.date(), None)
-    if path.exists():
-        side = path.with_name(path.stem + ".extended.parquet")
-        loaded = _load_if_covers(side, start_ts, end_ts, None)
-        if loaded is not None:
-            return loaded
-        if side.exists():
-            _coverage_error(side, _read_meta(side), start_ts.date(), end_ts.date(), None)
-        frame = fetch_index(symbol, _ymd(start_ts), _ymd(end_ts))
-        _store_download(frame, side, start_ts, end_ts, None, symbol)
-        return frame
-    frame = fetch_index(symbol, _ymd(start_ts), _ymd(end_ts))
-    _store_download(frame, path, start_ts, end_ts, None, symbol)
+    frame, _hit = _cached_or_fetch(
+        raw_dir / "index" / f"{symbol}.parquet",
+        start_ts,
+        end_ts,
+        None,
+        symbol,
+        lambda: fetch_index(symbol, _ymd(start_ts), _ymd(end_ts)),
+    )
     return frame
+
+
+def download_cached_market(
+    codes: list[str],
+    benchmark: str,
+    start,
+    end,
+    adjust: str,
+    raw_dir: Path,
+    workers: int = 4,
+    on_item=None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Download or reuse one file per symbol. ``on_item(done, total, symbol, from_cache)`` runs on the caller thread."""
+    start_ts, end_ts = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    symbols = [str(code).zfill(6)[-6:] for code in codes]
+    total = len(symbols) + 1
+    stats = {"hit": 0, "miss": 0}
+    done = 0
+    frames: list[pd.DataFrame] = []
+
+    def _report(symbol: str, hit: bool) -> None:
+        nonlocal done
+        done += 1
+        stats["hit" if hit else "miss"] += 1
+        if on_item is not None:
+            on_item(done, total, symbol, hit)
+
+    def _stock(code: str) -> tuple[str, pd.DataFrame, bool]:
+        frame, hit = _cached_or_fetch(
+            raw_dir / "prices" / f"{code}.parquet",
+            start_ts,
+            end_ts,
+            adjust,
+            code,
+            lambda: fetch_stock(code, _ymd(start_ts), _ymd(end_ts), adjust),
+        )
+        return code, frame, hit
+
+    if workers <= 1 or len(symbols) <= 1:
+        for code in symbols:
+            code, frame, hit = _stock(code)
+            frames.append(frame)
+            _report(code, hit)
+    else:
+        with ThreadPoolExecutor(max_workers=min(int(workers), len(symbols))) as pool:
+            futures = [pool.submit(_stock, code) for code in symbols]
+            for future in as_completed(futures):
+                code, frame, hit = future.result()
+                frames.append(frame)
+                _report(code, hit)
+    prices = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    market, hit = _cached_or_fetch(
+        raw_dir / "index" / f"{benchmark}.parquet",
+        start_ts,
+        end_ts,
+        None,
+        benchmark,
+        lambda: fetch_index(benchmark, _ymd(start_ts), _ymd(end_ts)),
+    )
+    _report(benchmark, hit)
+    return prices, market, stats
 
 
 def read_industry_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -274,6 +366,7 @@ def read_factor_frame(frame: pd.DataFrame) -> pd.DataFrame:
         "rmw": {"rmw", "盈利", "盈利因子"},
         "cma": {"cma", "投资", "投资因子"},
         "umd": {"umd", "mom", "动量", "动量因子"},
+        "rf": {"rf", "rf_dly", "无风险利率"},
     }
     for name, aliases in optional.items():
         column = _find_column(frame, aliases)
@@ -289,7 +382,7 @@ def prepare_factors(frame: pd.DataFrame | None) -> pd.DataFrame | None:
     if frame is None or len(frame) == 0:
         return None
     if {"date", "mkt", "smb", "hml"}.issubset(frame.columns):
-        columns = ["date", "mkt", "smb", "hml", *[name for name in ("rmw", "cma", "umd") if name in frame.columns]]
+        columns = ["date", "mkt", "smb", "hml", *[name for name in ("rmw", "cma", "umd", "rf") if name in frame.columns]]
         out = frame[columns].copy()
         out["date"] = pd.to_datetime(out["date"]).dt.normalize()
         for column in columns:

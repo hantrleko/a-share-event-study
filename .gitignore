@@ -14,6 +14,12 @@ data/raw/prices/**
 !data/raw/prices/.gitkeep
 data/raw/index/**
 !data/raw/index/.gitkeep
+data/raw/sw/**
+!data/raw/sw/.gitkeep
+data/raw/status/**
+!data/raw/status/.gitkeep
+data/jobs/**
+!data/jobs/.gitkeep
 data/intermediate/**
 !data/intermediate/.gitkeep
 data/processed/**

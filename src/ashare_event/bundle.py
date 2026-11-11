@@ -43,6 +43,11 @@ def build_zip(result) -> bytes:
     ]
     if result.simulated:
         lines.append("本次数值来自模拟样本，不能写入论文。")
+    specs = getattr(result, "specs", None)
+    if isinstance(specs, pd.DataFrame) and len(specs):
+        from ashare_event.specs import spec_sentence
+
+        lines.append(spec_sentence(specs))
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("methods_note.txt", ("\n".join(lines) + "\n").encode("utf-8"))
@@ -69,6 +74,8 @@ def build_zip(result) -> bytes:
                 archive.writestr(f"csv/placebo_{mode}.csv", frame.to_csv(index=False).encode("utf-8-sig"))
         if table_dir is not None and table_dir.exists():
             for path in sorted(table_dir.glob("*.tex")):
+                if path.name == "table_specs.tex" and isinstance(specs, pd.DataFrame) and len(specs):
+                    continue
                 text = path.read_text(encoding="utf-8").strip()
                 if text:
                     archive.writestr(f"tex/{path.name}", text.encode("utf-8"))
@@ -77,6 +84,7 @@ def build_zip(result) -> bytes:
                 if path.stat().st_size >= 800:
                     archive.writestr(f"png/{path.name}", path.read_bytes())
         from ashare_event.replication import replication_files
+        from ashare_event.specs import spec_tex
         from ashare_event.tables import attrition_table
 
         dropped = getattr(result, "dropped_events", None)
@@ -93,6 +101,9 @@ def build_zip(result) -> bytes:
         ):
             tex = attrition_table(attrition, cfg.language, bool(getattr(result, "simulated", False)))
             archive.writestr("tex/table_attrition.tex", tex.encode("utf-8"))
+        if isinstance(specs, pd.DataFrame) and len(specs):
+            archive.writestr("csv/specs_tried.csv", specs.to_csv(index=False).encode("utf-8-sig"))
+            archive.writestr("tex/table_specs.tex", spec_tex(specs).encode("utf-8"))
         for name, payload in replication_files(result).items():
             archive.writestr(name, payload)
     return buf.getvalue()

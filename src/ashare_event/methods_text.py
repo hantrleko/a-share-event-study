@@ -11,20 +11,66 @@ _MODELS = {
     "zh": {
         "market": "市场模型：在估计窗内为每家公司拟合「个股收益 = 截距 + 斜率 × 基准收益」",
         "market_adjusted": "市场调整模型：事件窗收益直接减去基准收益，不估计截距和斜率",
-        "industry": "行业基准的市场模型：斜率对着使用者提供的行业指数，而不是宽基指数",
-        "ff3": "三因子模型：截距加上使用者提供的 mkt、smb 和 hml",
+        "industry": "行业基准的市场模型：斜率对着行业指数，而不是宽基指数",
+        "ff3": "三因子模型：截距加上 mkt、smb 和价值因子",
         "ff5": "五因子模型：在三因子之外加上使用者提供的 rmw 和 cma",
         "carhart": "Carhart 四因子：在三因子之外加上使用者提供的 umd",
     },
     "en": {
         "market": "a market model fitted in the estimation window",
         "market_adjusted": "a market-adjusted model that subtracts the benchmark return",
-        "industry": "a market model whose benchmark is a user-supplied industry index",
-        "ff3": "a three-factor model using user-supplied mkt, smb, and hml",
+        "industry": "a market model whose benchmark is an industry index",
+        "ff3": "a three-factor model using mkt, smb, and a value factor",
         "ff5": "a five-factor model that also uses user-supplied rmw and cma",
         "carhart": "a Carhart model that also uses a user-supplied umd factor",
     },
 }
+
+
+def _benchmark_zh(cfg: StudyConfig) -> str:
+    industry = cfg.extra.get("industry_source")
+    factor = cfg.extra.get("factor_source")
+    if industry == "shenwan_l1":
+        return "行业指数是申万一级，按分类历史在事件日有效的一级行业匹配。交易日仍按宽基指数。事件表里的行业名称只用于筛选。"
+    if factor == "ch3":
+        return (
+            "三因子是 Liu-Stambaugh-Yuan CH3 日频的市场超额收益、SMB 和 VMG。VMG 存在 hml 列，不是 Fama-French 的 HML。"
+            "个股收益先减去无风险利率。五因子的 RMW、CMA 和 Carhart 的 UMD 不在这份库里。"
+        )
+    if cfg.model in {"industry", "ff3", "ff5", "carhart"}:
+        return "行业指数或因子由使用者上传。五因子需要 RMW、CMA，Carhart 需要 UMD。"
+    return "基准默认是沪深 300。"
+
+
+def _benchmark_en(cfg: StudyConfig) -> str:
+    industry = cfg.extra.get("industry_source")
+    factor = cfg.extra.get("factor_source")
+    if industry == "shenwan_l1":
+        return "The industry index is Shenwan level 1, matched from the classification in effect on the event date. "
+    if factor == "ch3":
+        return "The three factors are Liu-Stambaugh-Yuan CH3: market excess, SMB, and VMG. Stock returns are in excess of the risk-free rate. "
+    if cfg.model in {"industry", "ff3", "ff5", "carhart"}:
+        return "Industry indexes or factors are supplied by the user. "
+    return "The default benchmark is the CSI 300. "
+
+
+def _limit_zh(cfg: StudyConfig) -> str:
+    if cfg.drop_event_day_limit:
+        return (
+            "事件日涨跌停的公司-事件已从 CAR 样本剔除。交易所涨停池不含 ST 和科创板，跌停池只覆盖近 30 日；"
+            "名单没有覆盖到的，用板块和公司名称推断的带宽。"
+        )
+    return "事件日若靠近按板块推断的涨跌停带宽，会在样本日志里计数。默认不因此删行。"
+
+
+def _limit_en(cfg: StudyConfig) -> str:
+    if cfg.drop_event_day_limit:
+        return (
+            "Firm-events with a limit hit on the event day are dropped. "
+            "The exchange limit-up list omits ST and STAR names, and the limit-down list covers about 30 days; "
+            "other names use the board band."
+        )
+    return "Days close to a heuristic price-limit band are counted in the sample log and are not dropped."
 
 
 def _supplement_zh(cfg: StudyConfig) -> str:
@@ -40,6 +86,12 @@ def _supplement_zh(cfg: StudyConfig) -> str:
     if int(cfg.market_lags or 0):
         parts.append(
             "估计窗加入市场收益的前一日和后一日，斜率相加。事件窗预测只用同期市场收益。方差仍按单指数公式，这是近似。"
+        )
+    if cfg.extra.get("signal_source") == "mda_digital_per_k":
+        parts.append(
+            "信号成本一栏来自年报文本特征引擎的管理层讨论数智化或人工智能用词，单位是每千词。"
+            "同一引擎的绿色/ESG 与地缘每千词各自成列，不写入合法性缺口。"
+            "这些都是披露用词强度，不是信号成本、ESG 表现或地缘冲击本身，系数仍是相关。"
         )
     return "".join(parts)
 
@@ -59,6 +111,13 @@ def _supplement_en(cfg: StudyConfig) -> str:
         parts.append(
             " The estimation window adds one market lead and one lag, and the slopes are summed. "
             "The event-window forecast uses only the same-day market return. Variance stays the single-index formula."
+        )
+    if cfg.extra.get("signal_source") == "mda_digital_per_k":
+        parts.append(
+            " The signal-cost column is the annual-report text engine's MD&A digital or AI words per thousand tokens."
+            " That engine's ESG and geopolitical intensities stay in their own columns."
+            " All three are disclosure-word intensities, not measured signal cost, ESG performance, or a geopolitical shock."
+            " The coefficient remains an association."
         )
     return "".join(parts)
 
@@ -92,7 +151,7 @@ def render_methods(
             ),
             (
                 f"收益是简单收益率。模型是{_MODELS['zh'].get(cfg.model, cfg.model)}。"
-                "行业指数和三因子都由使用者提供，程序不下载、也不自行匹配申万行业或因子库。"
+                f"{_benchmark_zh(cfg)}"
                 f"估计窗为 {window_label(*cfg.estimation_window)}，必须整段落在路径窗 {window_label(*cfg.path_window)} "
                 f"和报告窗 {windows} 的左边。回归窗是 {window_label(*cfg.regression_window)}。"
             ),
@@ -112,7 +171,7 @@ def render_methods(
                 "双向聚类列同时使用公司和事件日。聚类数较少时，快照里另有 wild cluster bootstrap p，星号仍来自聚类标准误。"
                 "系数是累计异常收益和公司特征的相关。市场模型异常收益不是平均处理效应。"
             ),
-            "事件日若靠近按板块推断的涨跌停带宽，会在样本日志里计数。这是启发式标记，不是交易所的涨跌停状态表，程序不因此删行。",
+            _limit_zh(cfg),
             _supplement_zh(cfg),
         ]
     )
@@ -126,7 +185,7 @@ def render_methods(
             ),
             (
                 f"Returns are simple returns. The benchmark is {_MODELS['en'].get(cfg.model, cfg.model)}. "
-                "Industry indexes and factors are supplied by the user; the program does not download them. "
+                f"{_benchmark_en(cfg)}"
                 f"The estimation window is {window_label(*cfg.estimation_window)}, strictly before the path "
                 f"{window_label(*cfg.path_window)} and the reported windows {windows}. "
                 f"The regression window is {window_label(*cfg.regression_window)}."
@@ -149,7 +208,7 @@ def render_methods(
                 "wild cluster bootstrap p-values; stars still use the clustered standard errors. "
                 "Coefficients are associations. A market-model abnormal return is not an average treatment effect."
             ),
-            "Days close to a heuristic price-limit band are counted in the sample log and are not dropped.",
+            _limit_en(cfg),
             _supplement_en(cfg),
         ]
     )
